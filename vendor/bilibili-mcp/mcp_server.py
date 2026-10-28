@@ -38,6 +38,21 @@ from bilibili_api.video_uploader import (
 from bilibili_api.utils.picture import Picture
 from bilibili_api.login_v2 import QrCodeLogin, QrCodeLoginEvents
 
+# ⭐ 2026-10-28 自定义：**怎么 @ 你**。由宿主通过环境变量下发，这一层强制执行
+#    （模型写错了会被改写掉，不靠它自觉）：
+#      top = 主评论正文里 @
+#      dm  = 主评论不带 @，发完由这里私信把「评论原文 + 链接」发给主人
+#    另外有一个**独立开关** BILI_MENTION_NESTED（默认关）：
+#      开 = 凡是「回复别人的评论」（rpid>0）都强制以「@昵称」开头
+#           —— 也就是「看到有意思的评论，就在那条下面回一句 @ 你」
+_MENTION_MODE = (os.environ.get("BILI_MENTION_MODE") or "top").strip().lower()
+_MENTION_NAME = (os.environ.get("BILI_MENTION_NAME") or "").strip()
+_MENTION_NESTED = (os.environ.get("BILI_MENTION_NESTED") or "").strip().lower() in ("1", "true", "on", "yes")
+try:
+    _MENTION_UID = int(os.environ.get("BILI_MENTION_UID") or 0)
+except (TypeError, ValueError):
+    _MENTION_UID = 0
+
 # 2.3.0 throttle: every read tool sleeps 0.6-1.6s before running
 async def _throttle():
     try:
@@ -645,8 +660,188 @@ async def bili_video_info(bvid: str) -> str:
 
 # ========== Tool 6: 回复评论 ==========
 
+def _strip_mention(text: str) -> str:
+    """把正文里的 @某人 整段去掉（连它旁边的空格一起收拾干净）。"""
+    if not _MENTION_NAME:
+        return text
+    t = re.sub(r"@\s*" + re.escape(_MENTION_NAME) + r"\s*", "", text)
+    t = re.sub(r"[ \t]{2,}", " ", t).strip()
+    return t or text
+
+
+def _apply_mention(text: str, rpid: int) -> str:
+    """按配置改写评论正文 —— 这是「怎么 @ 你」的执行点。
+
+    两种场景，各管各的（互不影响）：
+      · 主评论（rpid=0）→ 看 `mentionMode`
+          top = 正文里必须有 @你（顺手把「@ 你」压成「@你」）
+          dm  = 正文里一个 @ 都不许有（改由私信把这条评论发给你）
+      · 回复别人的评论（rpid>0）→ 只看独立开关「在有意思的评论下 @ 你」
+          开 = 强制以「@你」开头；关 = 正文一个字不动
+               （关着必须不动 —— 否则「只回楼中楼」那个老功能会被莫名塞 @）
+    """
+    if not _MENTION_NAME:
+        return text
+    tag = "@" + _MENTION_NAME
+
+    # ── 回复别人的评论 ──
+    if rpid > 0:
+        if _MENTION_NESTED and not text.lstrip().startswith(tag):
+            return tag + " " + text.lstrip()
+        return text
+
+    # ── 主评论 ──
+    if _MENTION_MODE == "dm":
+        return _strip_mention(text)
+    # 默认 top：先把「@ 昵称」（@ 后面带空格）压成「@昵称」—— B站 只认紧挨着的写法
+    text = re.sub(r"@\s*" + re.escape(_MENTION_NAME), "@" + _MENTION_NAME, text)
+    if tag not in text:
+        text = (text.rstrip() + " " + tag).strip()
+    return text
+
+
+async def _share_comment_by_dm(uid: int, bvid: str, text: str) -> bool:
+    """第三种 @ 方式：把刚发的评论用私信发给主人。"""
+    cred = get_cred()
+    body = (
+        "我在这个视频下面留了条评论：\n"
+        f"https://www.bilibili.com/video/{bvid}\n\n"
+        f"{text}"
+    )
+    if len(body) > 470:
+        body = body[:450] + "…"
+    res = await session.send_msg(
+        credential=cred,
+        receiver_id=uid,
+        msg_type=session.EventType.TEXT,
+        content=body,
+    )
+    data = res if isinstance(res, dict) else {}
+    if data.get("msg_key"):
+        return True
+    try:
+        return int(data.get("code", 0) or 0) == 0
+    except (TypeError, ValueError):
+        return False
+
+
+# ⭐ 2026-10-28：**「在有意思的评论下 @ 你」的硬闸门**。
+#    为什么不交给模型判断：它对"有意思"的标准太宽 —— 一句「大肥鱼」「笑死」在它眼里
+#    也算有趣，结果就是往人堆里挤；而热评底下本来就一堆人抢答，回进去最像机器人。
+#    所以这里把它**说要回的那条评论原文**拿来，用可判定的规则过一遍：
+#      去标点后 < 10 字          ⇒ 太短，多半是梗
+#      命中梗词 且 去标点 < 20 字 ⇒ 玩梗 / 纯情绪
+#      基本是重复字符            ⇒ 刷屏
+#    闸门只判"够不够格"，不判"好不好" —— 好不好交给提示词。
+_NESTED_MEME = [
+    "大肥鱼", "绷不住", "笑死", "笑麻", "笑不活", "破防", "泪目", "太好哭", "好哭",
+    "前排", "沙发", "打卡", "路过", "三连", "已投币", "支持一下", "顶一下",
+    "哈哈哈哈", "嘿嘿嘿", "awsl", "绝了", "爱了", "绝绝子", "yyds", "爷青回",
+    "好活", "整活", "整挺好", "急了", "格局打开", "格局", "典中典", "典",
+]
+
+
+# 一栋楼里回复超过这个数，就别往里挤了（挤进去没人看，而且"和二十个人一起回同一条"最像机器人）
+_NESTED_MAX_RCOUNT = 20
+# 楼中楼抽样里，"短/玩梗"的比例超过这个值，说明这楼已经变味了 —— 不进去
+_NESTED_JUNK_RATIO = 0.6
+# 这一楼在**吵架**（有人身攻击）⇒ 一律不进
+_NESTED_ATTACK = ["傻逼", "脑残", "你妈", "去死", "狗东西", "有病", "神经病", "闭嘴", "滚蛋"]
+# 这一楼在**抵触玩梗**（"讨厌大肥鱼""别刷了"这种）⇒ 不进：
+#   在这种楼里插一句，只会被当成同一类人在拱火。必须跟梗词同时出现才算，
+#   否则「我讨厌这个观点」这种正常讨论会被误伤。
+_NESTED_AVOID = ["讨厌", "反感", "烦死", "受够了", "受够", "别刷", "刷屏", "滚出", "吵死", "没完没了", "无聊"]
+
+
+# 这条留言**像是 AI / 机器人发的** ⇒ 不回。
+#   只看「那条留言本身」，不看整楼 —— 一栋正常讨论的楼里夹了一条 AI 回复，
+#   不该让整栋楼都被跳过。也刻意只收「自称/自曝」的说法，
+#   免得「你觉得 DeepSeek 怎么样」这种真人讨论被误伤。
+_NESTED_AI_HINTS = [
+    "作为ai", "作为一个ai", "作为人工智能", "我是一个ai", "我是一个人工智能",
+    "我是ai助手", "我是人工智能助手", "我是机器人", "我是自动回复",
+    "由ai生成", "ai生成的内容", "本回复由", "自动回复", "ai总结", "ai摘要",
+    "（ai", "(ai", "［ai", "[ai",
+]
+
+
+def _looks_like_ai(text: str) -> bool:
+    low = (text or "").lower()
+    if not low:
+        return False
+    return any(h in low for h in _NESTED_AI_HINTS)
+
+
+def _nested_gate(parent_text: str, parent_rcount: int = 0, thread_sample: str = "") -> str:
+    """判「要回复的那条评论 + 它所在的楼」够不够格。
+
+    返回空串 = 放行；否则返回拒绝原因（这句话会原样回到模型那边，让它换一条或放弃）。
+    """
+    # ── ① 楼层本身：人太多就别挤 ──
+    try:
+        rc = int(parent_rcount or 0)
+    except (TypeError, ValueError):
+        rc = 0
+    if rc > _NESTED_MAX_RCOUNT:
+        return (f"那条评论底下已经有 {rc} 条回复了（超过 {_NESTED_MAX_RCOUNT} 条）—— 挤进去没人看得见，"
+                "而且「和一大群人一起回同一条」是最像机器人。换一条冷一点的，或者这一轮不回。")
+
+    # ── ② 这条留言像是 AI / 机器人发的 ⇒ 不回 ──
+    #    跟机器人对话毫无意义，而且「两个机器人在评论区互相回复」是最显眼的信号。
+    if _looks_like_ai(parent_text or ""):
+        return ("那条留言看措辞像 AI / 机器人发的（出现了「作为AI」「由AI生成」这类自称），不回 —— "
+                "跟机器人对话没有意义，而且两个机器人在评论区互相回复是最显眼的。换一条真人写的。")
+
+    # ── ③ 这一楼的气氛：在对骂 / 在抵触玩梗 ⇒ 躲开 ──
+    hay = (parent_text or "") + "\n" + (thread_sample or "")
+    low_hay = hay.lower()
+    for w in _NESTED_ATTACK:
+        if w in low_hay:
+            return ("这一楼在吵架（出现了人身攻击），不进去 —— 掺和进去只会变成拱火。"
+                    "换一条正常讨论的，或者这一轮不回。")
+    if any(w in low_hay for w in _NESTED_MEME):
+        for w in _NESTED_AVOID:
+            if w in low_hay:
+                return (f"这一楼在抵触玩梗（出现了「{w}」），别进去 —— "
+                        "在这种楼里插一句，只会被当成同一类人在拱火。换一条正常讨论的。")
+
+    # ── ④ 那条评论本身 ──
+    t = re.sub(r"_|[^\w]+", "", parent_text or "", flags=re.UNICODE)
+    if not t:
+        return ("没有把目标评论的原文传进来（parent_text 为空）。"
+                "要回一条评论，必须把那条评论的正文一起传进来，我据此判断它够不够格。")
+    n = len(t)
+    if n < 10:
+        return f"那条评论去掉标点只有 {n} 个字 —— 这种基本是玩梗或一句情绪，接不上话。换一条，或者这一轮不回。"
+    low = t.lower()
+    for w in _NESTED_MEME:
+        if w in low and n < 20:
+            return (f"那条评论是「{w}」这类梗 / 纯情绪（去标点 {n} 字），不接。"
+                    "要找有信息量的：讲了自己的经历、纠了错、补了数据、提了一个具体问题。")
+    if len(set(t)) <= 3:
+        return "那条评论基本是重复字符（刷屏式），不接。"
+
+    # ── ⑤ 整栋楼：已经全是梗就别进去（模型看过楼中楼才会传这个，没传就跳过这条判据）──
+    lines = [x.strip() for x in (thread_sample or "").splitlines() if x.strip()]
+    if len(lines) >= 3:
+        junk = 0
+        for line in lines:
+            lt = re.sub(r"_|[^\w]+", "", line, flags=re.UNICODE)
+            short = len(lt) < 10
+            meme = any(w in lt.lower() for w in _NESTED_MEME) and len(lt) < 20
+            if short or meme:
+                junk += 1
+        ratio = junk / len(lines)
+        if ratio >= _NESTED_JUNK_RATIO:
+            return (f"这一楼已经变了味：抽样 {len(lines)} 条回复里，"
+                    f"{junk} 条是玩梗或一句情绪（{ratio:.0%}）。别再往里添了 —— "
+                    "挑一栋还在正常讨论的楼，或者这一轮不回。")
+    return ""
+
+
 @tool()
-async def bili_reply(bvid: str, text: str, rpid: int = 0, root: int = 0) -> str:
+async def bili_reply(bvid: str, text: str, rpid: int = 0, root: int = 0, parent_text: str = "",
+                     parent_rcount: int = 0, thread_sample: str = "") -> str:
     """
     在B站视频下发表评论或回复某条评论
 
@@ -655,12 +850,26 @@ async def bili_reply(bvid: str, text: str, rpid: int = 0, root: int = 0) -> str:
         text: 评论/回复的文本内容
         rpid: 要回复的目标评论ID（0表示发表新评论）
         root: 楼层根评论ID（回复一级评论时不用填，回复楼中楼时填根评论ID）
+        parent_text: **要回复的那条评论的原文**。回复别人时必填 —— 宿主用它判断这条
+                     留言够不够格（玩梗、纯情绪、太短的会被拒）。照抄原文，别改写、别省略。
+        parent_rcount: 那条评论**已有的回复数**（bili_comments 返回里的 rcount）。
+                       超过 20 条就不往里挤了 —— 挤进去没人看得见，也最像机器人。
+        thread_sample: 楼中楼**抽样几条回复的原文**（一行一条，2~6 条即可）。
+                       如果这一楼已经全是玩梗/一句情绪，宿主会拦下 —— 所以先看一眼再传。
     
     Returns:
         发表结果
     """
     _deny = _guard("bili_reply")
     if _deny: return _deny
+    # ⭐ 2026-10-28：回复别人时的**质量闸门**（规则见 _nested_gate 上面的说明）
+    if _MENTION_NESTED and rpid > 0:
+        _why = _nested_gate(parent_text, parent_rcount, thread_sample)
+        if _why:
+            return json.dumps({"ok": False, "sent": False, "blocked_by": "nested_quality", "error": _why}, ensure_ascii=False)
+    # ⭐ 2026-10-28 自定义：按「怎么 @ 你」改写正文
+    #    （top=补 @ · nested/dm 主评论去 @ · nested 楼中楼补 @）
+    text = _apply_mention(text, rpid)
     # ⭐ 语感闸门：撞八股 / 撞自己以前的 / 撞这条视频的热评 ⇒ 不发，把改法告诉模型
     _style = await _style_reason(text, bvid, get_cred())
     if _style:
@@ -703,6 +912,16 @@ async def bili_reply(bvid: str, text: str, rpid: int = 0, root: int = 0) -> str:
                 val = result.get(key)
                 if isinstance(val, (int, str)) and str(val).strip() and str(val) != "0":
                     out[key] = val
+        # ⭐ 2026-10-28 自定义：第三种 @ 方式 —— 主评论不带 @，改由私信把这条评论发给主人
+        if _MENTION_MODE == "dm" and rpid == 0 and _MENTION_UID > 0:
+            try:
+                ok = await _share_comment_by_dm(_MENTION_UID, bvid, text)
+                out["dm_shared"] = bool(ok)
+                if not ok:
+                    out["dm_error"] = "私信被拒（可能不是好友 / 触发限流），评论本身已发"
+            except Exception as _e:
+                out["dm_shared"] = False
+                out["dm_error"] = str(_e)[:140]
         return json.dumps(out, ensure_ascii=False)
     except Exception as e:
         return json.dumps({"success": False, "error": str(e)}, ensure_ascii=False)
