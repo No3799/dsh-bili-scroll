@@ -643,6 +643,16 @@ async def bili_video_info(bvid: str) -> str:
     }, ensure_ascii=False)
 
 
+def _normalize_mention(text: str) -> str:
+    """把「@ 昵称」压成「@昵称」。
+
+    B站 只认紧挨着的写法：`@ No3799` 会被当成普通文字，**不会真的 @ 到人**，
+    而且不会有任何报错 —— 评论照样发出去、接口照样返回成功，只是对方收不到通知。
+    模型写中文时习惯在 @ 后面加一个空格，所以这里在发送前统一压一遍。
+    """
+    return re.sub(r"@\s+", "@", text or "")
+
+
 # ========== Tool 6: 回复评论 ==========
 
 @tool()
@@ -661,6 +671,8 @@ async def bili_reply(bvid: str, text: str, rpid: int = 0, root: int = 0) -> str:
     """
     _deny = _guard("bili_reply")
     if _deny: return _deny
+    # ⭐「@ 昵称」压成「@昵称」：B站 只认紧挨着的写法，带空格等于没 @ 到人（而且不报错）
+    text = _normalize_mention(text)
     # ⭐ 语感闸门：撞八股 / 撞自己以前的 / 撞这条视频的热评 ⇒ 不发，把改法告诉模型
     _style = await _style_reason(text, bvid, get_cred())
     if _style:
