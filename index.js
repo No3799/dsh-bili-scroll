@@ -1336,9 +1336,9 @@ function reportMeta() {
           + `\n⭐ **正文、回复数、楼中楼抽样都不用你填** —— 宿主会自己按这三个 id 去 B站 接口现取，`
           + `拿真实数据过闸门（这样你漏传或摘录也没法绕过）。取不到就不回，返回 blocked_by: nested_data。`
           + `\n宿主会按下面这些条件拒（返回 blocked_by: nested_quality）：`
-          + `原文太短 / 是玩梗或纯情绪 / **那条评论已经有 20 条以上回复** / **这一楼抽样的回复里大半是梗** / `
-          + `**那条留言看措辞像 AI 或机器人发的** / **这一楼在对骂或抵触玩梗**。`
-          + `被拒就换一条，或者这一轮不回；回执里若有 gate_note，是说明（比如样本不足没做整楼判断）。`
+          + `原文太短 / 是玩梗或纯情绪 / **那条评论已经有 20 条以上回复** / **这楼回复不到 3 条（样本不够，判不了整楼）** / `
+          + `**这一楼抽样的回复里大半是梗** / **那条留言看措辞像 AI 或机器人发的** / **这一楼在对骂或抵触玩梗**。`
+          + `被拒就换一条，或者这一轮不回。`
           + `\n⛔ **别往人堆里挤**：回复数很多的楼、已经玩成梗的楼，一律跳过 —— `
           + `挤进去没人看得见，而且「和一大群人一起回同一条」是最像机器人的行为。`
           + `\n⛔ **AI / 机器人的留言不回**：出现「作为AI」「由AI生成」这类自称的，直接跳过 —— `
@@ -1772,12 +1772,44 @@ function reportMeta() {
     child.on('error', (e) => { releaseRunLock(); log(`刷B站起不来：${e?.message ?? e}`) })
     // ⭐ 起不来/被杀掉也要把锁放开，否则之后每一轮都会被判成'上一轮还没结束' ✗
     child.on('close', () => { if (dutyChild === child) dutyChild = null })
-    return { started: true, why, profile: cfg.headlessProfile, cwd, log: logFile }
+    return { started: true, why, profile: cfg.headlessProfile, cwd, log: logFile, child }
    } catch (e) {
     log(`刷B站开跑失败（${why}）：${e?.stack ?? e}`)
     return { started: false, why, error: String(e?.message ?? e) }
    }
   }
+
+  /**
+   * ⭐ 2026-10-29（评审第 1 条）：**「spawn 没抛异常」不等于「真的跑起来了」**。
+   *   spawn 成功只说明进程建出来了 —— dsh 起不来、profile 坏了、模型/凭据缺失时，
+   *   子进程会在几秒内直接退出（历史上有过"0.17 秒就结束、code=0、什么都没干"的坑）。
+   *   所以定时调度要用这个函数：**等一小会儿**，确认它没有马上死掉，才认为启动成功。
+   *
+   *   判定：
+   *     · 在 waitMs 内退出，code≠0  ⇒ 失败（附退出码）
+   *     · 在 waitMs 内退出，code=0  ⇒ 也算失败（跑一轮不可能这么快，多半是空转）
+   *     · 撑过 waitMs 还活着          ⇒ 成功
+   */
+  const runDutyConfirmed = (why, waitMs = 6000) => new Promise((resolve) => {
+    const r = runDuty(why)
+    if (!r || !r.started || !r.child) return resolve(r || { started: false, why, error: '没起来' })
+    const child = r.child
+    let done = false
+    const finish = (ok, error) => {
+      if (done) return
+      done = true
+      clearTimeout(timer)
+      try { child.removeListener('exit', onExit) } catch { /* 无所谓 */ }
+      resolve({ ...r, confirmed: ok, error: ok ? '' : error })
+    }
+    const timer = setTimeout(() => finish(true, ''), waitMs)
+    const onExit = (code) => {
+      if (code === 0) finish(false, `进程 ${waitMs / 1000} 秒内就退出了（code=0）—— 多半是空转，不是真的跑起来`)
+      else finish(false, `进程 ${waitMs / 1000} 秒内就退出了（code=${code}）`)
+    }
+    child.once('exit', onExit)
+    child.once('error', (e) => finish(false, 'spawn 报错：' + (e?.message ?? e)))
+  })
 
   /* ─────────── 分时随机（2026-10-28 自定义） ───────────
    * 用户的要求：一天刷 N 条，但**不要同一时间刷 N 条**。
@@ -1887,8 +1919,9 @@ function reportMeta() {
         const skipped = overdue.slice(0, -1)
         const idx = overdue[overdue.length - 1]
         const why = `slot:${idx + 1}/${plan.times.length}`
-        const started = runDuty(why)
-        if (!started || !started.started) {
+        // ⭐ 用「确认版」：等几秒确认它没马上死掉，才算真的起来了
+        const started = await runDutyConfirmed(why)
+        if (!started || !started.started || started.confirmed === false) {
           // 没起来 —— **不消费时间点**，记一次退避
           bumpState({ lastWhy: why, slotRetryAt: new Date(now.getTime() + 10 * 60000).toISOString() })
           log(`分时到点（${why}）但没启动：${started?.error || '未知原因'} ⇒ 时间点保留，10 分钟后再试`)
@@ -1909,10 +1942,10 @@ function reportMeta() {
         if (!inWindow(now, WINDOWS[k])) continue
         const key = `${today}:${k}`
         if (st.windows?.[key]) continue
-        // ⚠️ 同一个毛病：先跑，跑起来了才记账
-        const started = runDuty(`window:${k}`)
-        if (!started || !started.started) {
-          log(`谷时窗口（${k}）到点但没启动：${started?.error || '未知原因'} ⇒ 不记账，下一跳再试`)
+        // ⚠️ 同一个毛病：先跑，**确认真的起来了**才记账
+        const started = await runDutyConfirmed(`window:${k}`)
+        if (!started || !started.started || started.confirmed === false) {
+          log(`谷时窗口（${k}）到点但没跑起来：${started?.error || '未知原因'} ⇒ 不记账，下一跳再试`)
           return
         }
         bumpState({ windows: { ...(st.windows || {}), [key]: true }, count: roundsToday(now) + 1, lastRunAt: now.toISOString(), lastActualRunAt: now.toISOString(), lastWhy: k })
