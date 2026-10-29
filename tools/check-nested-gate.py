@@ -1,75 +1,129 @@
 #!/usr/bin/env python3
-"""check-nested-gate.py —— 「在有意思的评论下 @ 你」那道质量闸门的回归检查。
+"""check-nested-gate.py —— 「在有意思的评论下 @ 你」的筛选回归检查（**离线、不连账号**）。
 
-**不联网、不连账号**：只 import vendored 的 mcp_server，直接对 `_nested_gate()` 喂用例。
+⭐ 2026-10-29 重写（评审第 4 条）：筛选依据**不再由模型自报**。
+   现在只认 bvid / rpid / root，正文、回复数、楼中楼抽样全部由
+   `_fetch_reply_context()` 现场从 B站 接口取；取不到就拒，绝不退回信任模型给的数据。
 
-这道闸门存在的理由（为什么不能交给模型自己判断）：
-模型对「有意思」的标准太宽 —— 一句「大肥鱼」「笑死」在它眼里也算有趣，
-结果就是往人堆里挤；而热评底下本来就一堆人抢答，回进去最像机器人。
-所以这里用**可判定**的规则兜底：
-
-  ① 那条评论已有 > 20 条回复        → 不挤（挤进去没人看得见）
-  ② 那条留言像 AI / 机器人发的      → 不回（跟机器人对话没意义）
-  ③ 楼里在对骂（人身攻击）          → 不进（只会变成拱火）
-  ④ 楼里在抵触玩梗（"讨厌X""别刷了"）→ 不进（会被当成同一类人）
-  ⑤ 留言去标点 < 10 字              → 不进（基本是梗或情绪）
-  ⑥ 命中梗词 且 < 20 字             → 不进（玩梗）
-  ⑦ 基本是重复字符                  → 不进（刷屏）
-  ⑧ 整楼抽样 > 60% 是梗 / 短句      → 不进（这楼已经变味）
-  （没传 parent_text → 直接拒，等于强制模型把原文交出来）
+覆盖：
+  · 闸门本身：正常放行 / 回复数超限 / AI 自称 / 玩梗 / 太短 / 重复字符
+  · 样本不足：明确返回「没判」，不当成通过
+  · 整楼变味：样本 ≥3 且梗占比超阈值 ⇒ 拒
+  · 取数失败：网络异常 / 接口非 0 / HTTP 非 200 / 目标不在该视频或其楼层
+  · 伪造旧参数：旧的 (parent_text, parent_rcount, thread_sample) 调用方式必须调不通
 
 用法：
     <家目录>/.venv/Scripts/python.exe tools/check-nested-gate.py
 """
+import asyncio
 import os
 import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(HERE, '..', 'vendor', 'bilibili-mcp'))
 
-from mcp_server import _nested_gate  # noqa: E402
+import mcp_server as m  # noqa: E402
 
 GOOD = "我在那条路住过三年，视频里第二家店去年就关门了"
-JUNK_THREAD = "大肥鱼\n笑死\n典\n绷不住了\n哈哈哈哈"
-OK_THREAD = ("这个价格是含税的吧？\n对，我上个月买过，含税 219\n"
-             "那家店周末要排队两小时\n我周六去的，十点就没号了")
 
-# (留言, 回复数, 楼中楼抽样, 期望放行?, 这条在验什么)
-CASES = [
-    (GOOD, 0, "", True, "正常留言，没有楼"),
-    (GOOD, 3, "", True, "楼里 3 条，还好"),
-    (GOOD, 20, "", True, "刚好 20 条（>20 才拒）"),
-    (GOOD, 21, "", False, "① 21 条 → 不往里挤"),
 
-    ("作为AI，我觉得这条视频很有意义，值得一看", 0, "", False, "② 自称 AI"),
-    ("由AI生成：这条视频讲了三件事", 0, "", False, "② 标注 AI 生成"),
-    ("我是机器人，正在学习中，请多关照", 0, "", False, "② 自称机器人"),
-    ("AI总结：本期重点在于供应链成本", 0, "", False, "② AI 总结"),
-    ("你觉得 DeepSeek 和 GPT 哪个好用", 0, "", True, "② 真人在讨论 AI，不该误伤"),
+def row(text, rcount=0, rpid=1, root=0):
+    return {"text": text, "rcount": rcount, "rpid": rpid, "root": root}
 
-    ("讨厌大肥鱼，这梗还没完没了了", 3, "", False, "④ 留言在抵触玩梗"),
-    (GOOD, 5, "别刷大肥鱼了行不行\n烦死了\n这梗早就烂了", False, "④ 楼里在抵触玩梗"),
-    (GOOD, 5, "你有病吧\n闭嘴", False, "③ 楼里在对骂"),
-    (GOOD, 5, "我讨厌这个观点\n但他说得有道理", True, "④ 只是意见不同（没梗）→ 可以进"),
 
-    (GOOD, 5, JUNK_THREAD, False, "⑧ 整楼全是梗"),
-    (GOOD, 5, OK_THREAD, True, "⑧ 整楼在正常讨论"),
-    ("大肥鱼", 2, "", False, "⑤/⑥ 留言本身就是梗"),
-    ("这里说错了，2023 款才有这个接口", 8, JUNK_THREAD, False, "留言够格但楼烂了"),
-    ("", 5, "", False, "没传原文 → 拒"),
-    ("aaaaaaaaaaaaaaaaaaaa", 0, "", False, "⑦ 重复字符"),
-]
+def case(name, target, sample, expect_pass, expect_note_has=None):
+    why, note = m._nested_gate(target, sample)
+    passed = (why == "")
+    ok = (passed == expect_pass)
+    if ok and expect_note_has:
+        ok = expect_note_has in (note or "")
+    print(("  ✓ " if ok else "  ✗ ") + name
+          + ("（放行" if passed else "（拒绝：" + (why or "")[:26] + "…")
+          + ("；" + note + "）" if note else "）"))
+    return ok
 
-fail = 0
-for text, rcount, sample, should_pass, why in CASES:
-    got = _nested_gate(text, rcount, sample)
-    passed = (got == "")
-    ok = (passed == should_pass)
-    if not ok:
-        fail += 1
-    tag = "放行" if passed else "拒绝"
-    print(('  ✓ ' if ok else '  ✗ ') + '[' + tag + '] ' + why
-          + ('' if ok else '   ← 期望' + ('放行' if should_pass else '拒绝') + '：' + got))
 
-print('\n✓ 闸门 %d 项全过' % len(CASES) if fail == 0 else '\n✗ %d 项不符' % fail)
-sys.exit(0 if fail == 0 else 1)
+def fetch_case(name, fake, args, expect_ok, expect_in_error=None):
+    """把 _get_comment_json 换成 fake，跑 _fetch_reply_context。"""
+    orig = m._get_comment_json
+    m._get_comment_json = fake
+    try:
+        r = asyncio.run(m._fetch_reply_context(*args))
+    finally:
+        m._get_comment_json = orig
+    ok = (r.get("ok") == expect_ok)
+    if ok and expect_in_error:
+        ok = expect_in_error in str(r.get("error") or "")
+    print(("  ✓ " if ok else "  ✗ ") + name
+          + ("（取到：" + str((r.get("target") or {}).get("text"))[:18] + "…）" if r.get("ok")
+             else "（拒：" + str(r.get("error"))[:38] + "…）"))
+    return ok
+
+
+async def boom(*a, **k):
+    raise TimeoutError("模拟超时")
+
+
+results = []
+
+print("=== 一、闸门本体 ===")
+results.append(case("正常留言、没有楼", row(GOOD), [], True))
+results.append(case("刚好 20 条回复", row(GOOD, 20), [], True))
+results.append(case("21 条回复 → 不挤", row(GOOD, 21), [], False))
+results.append(case("AI 自称 → 不回", row("作为AI，我觉得这条视频很有意义，值得一看"), [], False))
+results.append(case("真人讨论 AI → 放行", row("你觉得 DeepSeek 和 GPT 哪个好用"), [], True))
+results.append(case("留言本身是梗", row("大肥鱼"), [], False))
+results.append(case("重复字符", row("aaaaaaaaaaaaaaaaaaaa"), [], False))
+results.append(case("楼里有梗 + 抵触词", row(GOOD), [row("别刷大肥鱼了行不行"), row("烦死了")], False))
+results.append(case("楼里在对骂", row(GOOD), [row("你有病吧"), row("闭嘴")], False))
+results.append(case("楼里意见不同但没梗 → 放行", row(GOOD), [row("我讨厌这个观点"), row("但他说得有道理")], True))
+
+print("\n=== 二、样本不足：必须明说「没判」，不能当通过 ===")
+results.append(case("只有 2 条抽样", row(GOOD), [row("第一条真实讨论的内容"), row("第二条也还行")],
+                    True, expect_note_has="样本不足"))
+results.append(case("一条抽样都没有", row(GOOD), [], True, expect_note_has="样本不足"))
+
+print("\n=== 三、整楼变味（样本够才判）===")
+junk = [row("大肥鱼"), row("笑死"), row("典"), row("绷不住了")]
+results.append(case("4 条抽样全是梗 → 拒", row(GOOD), junk, False))
+ok_thread = [row("这个价格是含税的吧"), row("对，我上个月买过，含税 219"),
+             row("那家店周末要排队两小时"), row("我周六去的，十点就没号了")]
+results.append(case("4 条抽样都在正常讨论", row(GOOD), ok_thread, True, expect_note_has="整楼抽样"))
+
+print("\n=== 四、取数失败：一律拒（筛选依据绝不能回退到模型自报）===")
+
+
+def make_fake(replies=None, code=0, http_fail=False):
+    async def fake(url, params, cred):
+        if http_fail:
+            raise RuntimeError("HTTP 500")
+        return {"code": code, "message": "请求过于频繁" if code else "0",
+                "data": {"replies": replies or []}}
+    return fake
+
+
+results.append(fetch_case("网络超时", boom, (1, 7, 0, None), False, "取评论数据失败"))
+results.append(fetch_case("接口返回非 0", make_fake(code=-412), (1, 7, 0, None), False, "取评论列表失败"))
+results.append(fetch_case("HTTP 500", make_fake(http_fail=True), (1, 7, 0, None), False, "取评论数据失败"))
+results.append(fetch_case("目标不在前几页（可能已删）", make_fake(replies=[]), (1, 7, 0, None), False, "没找到"))
+results.append(fetch_case("楼中楼里没有这条 rpid（root=7，rpid=8）",
+                          make_fake(replies=[{"rpid": 999, "root": 7}]),
+                          (1, 8, 7, None), False, "这栋楼里没找到"))
+results.append(fetch_case("正常取到目标 + 抽样",
+                          make_fake(replies=[{"rpid": 7, "root": 0, "content": {"message": GOOD},
+                                              "member": {"uname": "a"}, "rcount": 1}]),
+                          (1, 7, 0, None), True))
+
+print("\n=== 五、伪造旧参数：老调用方式必须调不通 ===")
+try:
+    m._nested_gate("伪造的原文", 3, "伪造的抽样")
+    print("  ✗ 旧的 (parent_text, parent_rcount, thread_sample) 竟然还能调 —— 没有失效")
+    results.append(False)
+except TypeError as e:
+    print("  ✓ 旧调用方式已失效（TypeError：" + str(e)[:46] + "…）")
+    results.append(True)
+
+failed = results.count(False)
+print("\n%d 项用例，失败 %d 项" % (len(results), failed))
+print("✓ 全过" if failed == 0 else "✗ 有失败")
+sys.exit(0 if failed == 0 else 1)
