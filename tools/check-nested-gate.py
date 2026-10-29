@@ -66,22 +66,26 @@ async def boom(*a, **k):
 
 results = []
 
-print("=== 一、闸门本体 ===")
-results.append(case("正常留言、没有楼", row(GOOD), [], True))
-results.append(case("刚好 20 条回复", row(GOOD, 20), [], True))
-results.append(case("21 条回复 → 不挤", row(GOOD, 21), [], False))
-results.append(case("AI 自称 → 不回", row("作为AI，我觉得这条视频很有意义，值得一看"), [], False))
-results.append(case("真人讨论 AI → 放行", row("你觉得 DeepSeek 和 GPT 哪个好用"), [], True))
-results.append(case("留言本身是梗", row("大肥鱼"), [], False))
-results.append(case("重复字符", row("aaaaaaaaaaaaaaaaaaaa"), [], False))
+print("=== 一、闸门本体（都带 3 条正常抽样，避免被「样本不足」提前拦掉）===")
+OK3 = [row("这个价格是含税的吧"), row("对，我上个月买过，含税 219"), row("那家店周末要排队两小时")]
+results.append(case("正常留言、楼里正常", row(GOOD), OK3, True))
+results.append(case("刚好 20 条回复", row(GOOD, 20), OK3, True))
+results.append(case("21 条回复 → 不挤", row(GOOD, 21), OK3, False))
+results.append(case("AI 自称 → 不回", row("作为AI，我觉得这条视频很有意义，值得一看"), OK3, False))
+results.append(case("真人讨论 AI → 放行", row("你觉得 DeepSeek 和 GPT 哪个好用"), OK3, True))
+results.append(case("留言本身是梗", row("大肥鱼"), OK3, False))
+results.append(case("重复字符", row("aaaaaaaaaaaaaaaaaaaa"), OK3, False))
 results.append(case("楼里有梗 + 抵触词", row(GOOD), [row("别刷大肥鱼了行不行"), row("烦死了")], False))
 results.append(case("楼里在对骂", row(GOOD), [row("你有病吧"), row("闭嘴")], False))
-results.append(case("楼里意见不同但没梗 → 放行", row(GOOD), [row("我讨厌这个观点"), row("但他说得有道理")], True))
+results.append(case("楼里意见不同但没梗 → 放行", row(GOOD),
+                    [row("我讨厌这个观点，但他后面那段数据是对的"),
+                     row("两边都有点道理吧，我倾向他说的第二点"),
+                     row("说实话我不太同意第三条，地价没那么低")], True))
 
-print("\n=== 二、样本不足：必须明说「没判」，不能当通过 ===")
-results.append(case("只有 2 条抽样", row(GOOD), [row("第一条真实讨论的内容"), row("第二条也还行")],
-                    True, expect_note_has="样本不足"))
-results.append(case("一条抽样都没有", row(GOOD), [], True, expect_note_has="样本不足"))
+print("\n=== 二、样本不足：**不发**（不能嘴上说没判断、手上照发）===")
+results.append(case("只有 2 条抽样 → 拒", row(GOOD), [row("第一条真实讨论的内容"), row("第二条也还行")],
+                    False))
+results.append(case("一条抽样都没有 → 拒", row(GOOD), [], False))
 
 print("\n=== 三、整楼变味（样本够才判）===")
 junk = [row("大肥鱼"), row("笑死"), row("典"), row("绷不住了")]
