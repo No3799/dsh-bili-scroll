@@ -26,6 +26,10 @@ import struct
 import sys
 import tempfile
 from pathlib import Path
+# ⭐ 2026-10-29（评审第 1 条）：**必须在模块顶层导入**。
+#   之前只在几个函数里局部 `import aiohttp`，而新加的 _get_comment_json() 用的就是它
+#   ⇒ 一调用就 NameError: name 'aiohttp' is not defined（而且是运行时才炸，测试不跑到就发现不了）。
+import aiohttp
 from mcp.server.fastmcp import FastMCP
 from mcp.types import ImageContent, TextContent
 
