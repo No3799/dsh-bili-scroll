@@ -298,7 +298,7 @@ function WatchTab() {
         if (cfg && replyPer === null) setReplyPer(String(cfg.replyPerRound ?? 1))
         if (cfg && mention === null) setMention(cfg.mentionName || '')
         if (cfg && mentionMode === null) setMentionMode(cfg.mentionMode || 'top')
-        if (cfg && spread === null) setSpread(cfg.spread !== false)
+        if (cfg && spread === null) setSpread(cfg.spread === true)
         if (cfg && dmUid === null) setDmUid(cfg.dmUid ? String(cfg.dmUid) : '')
         if (cfg && dmMode === null) setDmMode(cfg.dmMode || 'only')
         if (cfg && dmWatch === null) setDmWatch(cfg.dmWatch !== false)   // 2.0 起默认开
@@ -643,8 +643,9 @@ function WatchTab() {
             })),
           h(ToggleRow, {
             label: '分时随机刷',
-            note: '一天的量摊到几个随机时间点，每个点只挑 1 条 —— 不再到点一口气刷完（建议开着）',
-            on: spread !== false,
+            note: '一天的量摊到几个随机时间点，每个点只挑 1 条 —— 不再到点一口气刷完。'
+              + '默认关（这是新行为，开不开由你定）；关着就是老规矩：每个谷时窗口跑一轮。',
+            on: spread === true,
             onChange: (v) => { setSpread(v); patch({ spread: v }, '分时随机') },
           }),
           st.lastRunAt ? h('div', { 'data-bd-note': '' }, `上次跑：${new Date(st.lastRunAt).toLocaleString('zh-CN')}`) : null),
@@ -670,6 +671,13 @@ function WatchTab() {
             (dmMode === 'off' || dmMode === 'both')
               ? '含「评论」的这两种，它才会在挑中的视频下面说话并 @ 你。'
               : '「私信」= 评论区一句话都不会说，所有东西都走私信。'),
+          /* ⚠️ 2026-10-29：宿主不再替用户打开 autoComment（那是拿用户的号说话），
+           *   所以选了含评论的投递方式、但评论开关是关的时候，得当面说清楚。 */
+          (dmMode === 'off' || dmMode === 'both') && !sw('autoComment')
+            ? h('div', { 'data-bd-msg': '', 'data-warn': '' },
+              '⚠️ 你选了含评论的投递方式，但「自动评论」是关的 —— 现在它不会在评论区说话。'
+              + '把上面的投递方式重新选一次（或改回「私信」）即可同步；不想评论就保持现状。')
+            : null,
           h('div', { 'data-bd-label': '' }, '要 @ 谁 / 私信发给谁（B站 昵称）'),
           h('input', {
             'data-bd-input': '', value: mention ?? '',
