@@ -88,8 +88,10 @@ export const Config = !z ? undefined : z.object({
   /** 每轮最多在几条评论下面 @ 你（0 = 不在评论区回复） */
   nestedPerRound: z.natural().default(1).extra('volatile', true),
   /** ⭐ 2026-10-28 自定义：**分时随机** —— 一天要刷 perDay 条，就摊到 perDay 个随机时间点上，
-   *  每个点只挑 1 条，不再"到点一口气刷 5 条"。关掉就退回老行为（每个谷时窗口跑一次） */
-  spread: z.boolean().default(true).extra('volatile', true),
+   *  每个点只挑 1 条，不再"到点一口气刷 5 条"。
+   *  ⚠️ 2026-10-29（评审第 3 条）：**默认改成 false**。它是新行为，不该在升级时
+   *  悄悄改变老用户"每个谷时窗口跑一轮"的节奏 —— 想要的人自己去设置页打开。 */
+  spread: z.boolean().default(false).extra('volatile', true),
   /** 关注关键词（空了用章程里默认那几组） */
   keywords: z.array(z.string()).default([]).extra('volatile', true),
   /** Python：指向 venv 里的那个最好 */
@@ -282,7 +284,7 @@ function reportMeta() {
     personaPrompt: '',
     perDay: 5, peakValley: false, noon: true, night: true, autoComment: false, transcribe: false, asrModel: 'small',
     dmMode: 'only', dmUid: 0,
-    keywords: [], commentPerRound: 1, mentionName: '', mentionMode: 'top', nestedMention: false, nestedPerRound: 1, spread: true, pythonPath: 'python', dshBin: '', headlessProfile: 'headless', overlayMcp: true, workspace: '', reportLevel: 'full', replyToComments: false, replyPerRound: 1, favFolderId: 0,
+    keywords: [], commentPerRound: 1, mentionName: '', mentionMode: 'top', nestedMention: false, nestedPerRound: 1, spread: false, pythonPath: 'python', dshBin: '', headlessProfile: 'headless', overlayMcp: true, workspace: '', reportLevel: 'full', replyToComments: false, replyPerRound: 1, favFolderId: 0,
     // ⭐ 2.3.0：手动轮 / 抓取量 / 排除词 / 评论长度 —— 少一项 normalize 就会把用户存的值丢掉
     manualMax: 3, manualCooldownMin: 10, searchSort: 'pubdate', searchPages: 2, fetchPerRound: 8, excludeWords: [], commentLength: 'medium',
   }
@@ -342,10 +344,10 @@ function reportMeta() {
     if ('nestedMention' in p) p.nestedMention = Boolean(p.nestedMention)
     if ('nestedPerRound' in p) p.nestedPerRound = Math.max(0, Math.min(Number(p.nestedPerRound) || 0, 5))
     if ('spread' in p) p.spread = Boolean(p.spread)
-    // ⭐ 2026-10-28：**评论开关由投递方式推导** —— 设置页已经把「自动评论并 @ 你」那个独立开关
-    //    收起来了（两个开关会互相打脸：选「只发评论」而自动评论是关的 ⇒ 一条都不发）。
-    //    这里归一一次，同时也治好旧配置里 dmMode=off/both 但 autoComment=false 的存量。
-    if (String(p.dmMode || 'only') !== 'only') p.autoComment = true
+    // ⚠️ 2026-10-29（评审第 3 条）：这里**不再**替用户把 autoComment 改成 true。
+    //    上一版为了让「投递方式=评论」能真的发出去，在 clampPatch 里强制置 true ——
+    //    但那会覆盖用户自己关掉的开关（升级或切换模式时偷偷打开"拿他的号说话"）。
+    //    现在只由界面在**用户主动切换投递方式**时一起提交两个键；这里保持用户原值。
     return p
   }
 
@@ -759,6 +761,7 @@ function reportMeta() {
       bvid: { type: 'string', description: 'BV号' },
       text: { type: 'string', description: '评论正文（短、干净、纯文本 @；别写敏感词）' },
       rpid: { type: 'number', description: '要回复的评论 id（0/不填 = 发新评论）' },
+      root: { type: 'number', description: '楼层根评论 id（回复楼中楼里的某条回复时必填；回复一级评论不用填）' },
       force: { type: 'boolean', description: '本人当场让你发的，传 true 越过"自动评论关着"的闸' },
     },
     async execute(args) {
@@ -773,10 +776,15 @@ function reportMeta() {
             : '要发评论得同时满足两条：设置里开着「自动评论并 @ 你」、并且填了「要 @ 谁」。或者本人当场让你发时传 force: true。',
         }
       }
+      // ⚠️ 2026-10-29（评审第 5 条）：这里必须跟后台那条路径参数一致 ——
+      //    root 要转发（否则楼中楼回复会挂错楼层）；parent_text / parent_rcount /
+      //    thread_sample 是旧版「让模型自报证据」的残留，**不再转发**（Python 侧也一律忽略），
+      //    筛选用的是 Python 自己按 bvid/rpid/root 现取的接口数据。
       return call('bili_reply', {
         bvid: String(args.bvid ?? ''),
         text: String(args.text ?? ''),
         rpid: Number(args.rpid) || 0,
+        root: Number(args.root) || 0,
       })
     },
   })
@@ -1323,13 +1331,14 @@ function reportMeta() {
           + `\n  · 提了一个**具体**的问题或反例（不是「真的吗」这种）。`
           + `\n⛔ **明确不算**：玩梗、纯情绪、纯夸赞、复读热评 —— 比如「大肥鱼」「笑死」「绷不住了」`
           + `「典」「前排」「三连了」，**这些一句都不许回**。`
-          + `\n📌 调 bili_reply 时**必须传三样**：`
-          + `parent_text（那条评论的原文，原样照抄）、parent_rcount（那条评论已有的回复数）、`
-          + `thread_sample（楼中楼抽 2~6 条原文，一行一条）。`
-          + `宿主会拿它们过**硬闸门**，下面任一情况直接拒（返回 blocked_by: nested_quality）：`
+          + `\n📌 调 bili_reply 时**只需要传定位信息**：\`bvid\` + \`rpid\`（要回的那条评论 id）；`
+          + `如果那条是**楼中楼里的回复**，再把 \`root\`（它所在楼层的根评论 id）一起传。`
+          + `\n⭐ **正文、回复数、楼中楼抽样都不用你填** —— 宿主会自己按这三个 id 去 B站 接口现取，`
+          + `拿真实数据过闸门（这样你漏传或摘录也没法绕过）。取不到就不回，返回 blocked_by: nested_data。`
+          + `\n宿主会按下面这些条件拒（返回 blocked_by: nested_quality）：`
           + `原文太短 / 是玩梗或纯情绪 / **那条评论已经有 20 条以上回复** / **这一楼抽样的回复里大半是梗** / `
           + `**那条留言看措辞像 AI 或机器人发的** / **这一楼在对骂或抵触玩梗**。`
-          + `被拒就换一条，或者这一轮不回。`
+          + `被拒就换一条，或者这一轮不回；回执里若有 gate_note，是说明（比如样本不足没做整楼判断）。`
           + `\n⛔ **别往人堆里挤**：回复数很多的楼、已经玩成梗的楼，一律跳过 —— `
           + `挤进去没人看得见，而且「和一大群人一起回同一条」是最像机器人的行为。`
           + `\n⛔ **AI / 机器人的留言不回**：出现「作为AI」「由AI生成」这类自称的，直接跳过 —— `
@@ -1854,6 +1863,10 @@ function reportMeta() {
       // ⭐ 闸门看的是「今天已经**挑到几条**」（从今天的报告里数出来），不是「跑了几轮」
       if (autoPickedToday(now) >= Number(cfg.perDay || 0)) return
       // ⭐⭐ 2026-10-28 自定义：**分时随机** —— 到点跑一轮，那一轮只挑 1 条
+      //    ⚠️ 2026-10-29（评审 1/2）：**先确认真的跑起来了，再消费时间点**。
+      //       启动失败 / 宿主正忙 / 找不到 dsh ⇒ 时间点保留，退避 10 分钟再试，任务不丢。
+      //       每次启动前还要再核一次窗口，并按「上次实际启动时间」卡住最小间隔
+      //       （计划隔 20 分钟 ≠ 实际隔 20 分钟，补跑会把它们挤在一起）。
       if (cfg.spread) {
         const plan = ensureSlotPlan(now)
         const overdue = []
@@ -1861,16 +1874,32 @@ function reportMeta() {
           if (!plan.done[i] && now.getTime() >= Number(plan.times[i])) overdue.push(i)
         }
         if (!overdue.length) return
-        // ⭐ 电脑关着错过了几个点？**只补最后那个**，更早的记成跳过 ——
-        //   否则开机后每 60 秒补跑一轮，等于把"分时"又变回"一口气刷完"。
-        for (const i of overdue.slice(0, -1)) plan.done[i] = true
+        // 还在允许的谷时窗口里吗？（周末全天算谷时；两个窗口都关 = 压根不该跑）
+        const anyWindow = ['noon', 'night'].some((k) => cfg[k] && inWindow(now, WINDOWS[k]))
+        if (!anyWindow) return                       // 不在允许时段：不消费，等下一个窗口
+        // 按「实际启动时间」卡最小间隔
+        const lastActual = st.lastActualRunAt ? new Date(st.lastActualRunAt).getTime() : 0
+        if (lastActual && now.getTime() - lastActual < MIN_SLOT_GAP) return
+        // 上次启动失败过？退避 10 分钟，别每 60 秒硬试一次
+        const retryAt = st.slotRetryAt ? new Date(st.slotRetryAt).getTime() : 0
+        if (retryAt && now.getTime() < retryAt) return
+
+        const skipped = overdue.slice(0, -1)
         const idx = overdue[overdue.length - 1]
+        const why = `slot:${idx + 1}/${plan.times.length}`
+        const started = runDuty(why)
+        if (!started || !started.started) {
+          // 没起来 —— **不消费时间点**，记一次退避
+          bumpState({ lastWhy: why, slotRetryAt: new Date(now.getTime() + 10 * 60000).toISOString() })
+          log(`分时到点（${why}）但没启动：${started?.error || '未知原因'} ⇒ 时间点保留，10 分钟后再试`)
+          return
+        }
+        // 起来了才消费；更早错过的点记成跳过（否则开机后会连着补跑好几轮）
+        for (const i of skipped) plan.done[i] = true
         plan.done[idx] = true
         try { writeFileSync(slotsFile, JSON.stringify(plan, null, 2), 'utf8') } catch { /* 写不进去下一跳再说 */ }
-        const why = `slot:${idx + 1}/${plan.times.length}`
-        log(`分时到点（${why}）—— 这一轮只挑 1 条` + (overdue.length > 1 ? `（错过 ${overdue.length - 1} 个点，已跳过）` : ''))
-        bumpState({ count: roundsToday(now) + 1, lastRunAt: now.toISOString(), lastWhy: why })
-        runDuty(why)
+        log(`分时到点（${why}）—— 这一轮只挑 1 条` + (skipped.length ? `（错过 ${skipped.length} 个点，已跳过）` : ''))
+        bumpState({ count: roundsToday(now) + 1, lastRunAt: now.toISOString(), lastActualRunAt: now.toISOString(), lastWhy: why })
         return
       }
       // ⭐ 「不写日报」那档没有报告可数 ⇒ 数不出条数就保守一点：一天只跑一轮
@@ -1880,8 +1909,13 @@ function reportMeta() {
         if (!inWindow(now, WINDOWS[k])) continue
         const key = `${today}:${k}`
         if (st.windows?.[key]) continue
-        bumpState({ windows: { ...(st.windows || {}), [key]: true }, count: roundsToday(now) + 1, lastRunAt: now.toISOString(), lastWhy: k })
-        runDuty(`window:${k}`)
+        // ⚠️ 同一个毛病：先跑，跑起来了才记账
+        const started = runDuty(`window:${k}`)
+        if (!started || !started.started) {
+          log(`谷时窗口（${k}）到点但没启动：${started?.error || '未知原因'} ⇒ 不记账，下一跳再试`)
+          return
+        }
+        bumpState({ windows: { ...(st.windows || {}), [key]: true }, count: roundsToday(now) + 1, lastRunAt: now.toISOString(), lastActualRunAt: now.toISOString(), lastWhy: k })
         return
       }
     } catch (e) {
@@ -2019,12 +2053,16 @@ function reportMeta() {
         cwd: stateDir, shell: dsh.shell, windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'],
         env: uvEnv({ BILI_DUTY_HOME: stateDir, ...(process.versions.electron ? { ELECTRON_RUN_AS_NODE: '1' } : {}) }),
       })
+      // ⭐ 2026-10-29（评审第 7 条）：把这个子进程记下来 —— 退出登录时要能停掉它，
+      //    否则它会拿着**旧账号的凭证**继续把消息回出去。
+      dmChild = child
       const toText = (buf) => { try { const b = Buffer.isBuffer(buf) ? buf : Buffer.from(String(buf)); const u = b.toString('utf8'); return u.includes('\uFFFD') ? (() => { try { return new TextDecoder('gbk').decode(b) } catch { return u } })() : u } catch { return String(buf) } }
       const pick = (buf) => { try { appendFileSync(logFile, toText(buf), 'utf8') } catch { /* 丢日志也不能抛 */ } }
       child.stdout?.on('data', pick)
       child.stderr?.on('data', pick)
       child.on('exit', (code) => {
         dmReplyRunning = false
+        if (dmChild === child) dmChild = null
         log(`私信回复结束（code=${code}）`)
         rotateLogIfBig()
         // ① 本来没有会话 id：跑完把它开出来的那个认领下来，下一条就能接着聊
@@ -2048,6 +2086,8 @@ function reportMeta() {
   let dmBusy = false
   // ⭐ 2.0.5：一条私信回复没跑完时，不要让下一条进来（不然两个进程抢同一个会话，DSH 会报 "already owned by an active write handle"）
   let dmReplyRunning = false
+  // ⭐ 2026-10-29（评审第 7 条）：私信回复子进程的句柄 —— 退出登录时要能停掉
+  let dmChild = null
   async function dmTick() {
     if (dmBusy) return
     dmBusy = true
@@ -3140,7 +3180,16 @@ function reportMeta() {
     //    正在跑一轮时拒绝：跑到一半凭证没了，那一轮会以很难懂的方式失败。
     if (req.method === 'POST' && path === '/api/bili-duty/logout') {
       const file = join(stateDir, 'bili_credential.json')
+      // ⚠️ 2026-10-29（评审第 7 条）：**先收拾还在跑的任务**，再删凭证。
+      //    只挡值班轮是不够的 —— 私信回复那个子进程也会拿着旧凭证继续回消息。
       if (dutyChild) return sendJson(res, 200, { ok: false, error: '正在跑一轮，等它跑完再退出登录' })
+      let killedDm = false
+      if (dmChild) {
+        try { dmChild.kill(); killedDm = true } catch { /* 已经退了 */ }
+        dmChild = null
+        dmReplyRunning = false
+        dmBusy = false
+      }
       let removed = false
       try {
         if (existsSync(file)) { rmSync(file, { force: true }); removed = true }
@@ -3148,9 +3197,20 @@ function reportMeta() {
         log('退出登录失败：' + String(e?.message ?? e))
         return sendJson(res, 200, { ok: false, error: '删不掉凭证文件：' + String(e?.message ?? e) })
       }
-      dmUidCache = 0                       // 换了号，之前按昵称查出来的 UID 也不能留着
-      log(removed ? '已退出登录：凭证 bili_credential.json 已删除' : '退出登录：本来就没有凭证，什么也没做')
-      return sendJson(res, 200, { ok: true, removed })
+      // 清掉**跟账号绑定**的缓存：内存里按昵称查到的 UID、磁盘上的昵称→UID 表和私信已读表。
+      // 不清的话，换号之后还会用旧账号的口径去查收件人 / 认为"这条私信已经回过了"。
+      dmUidCache = 0
+      const purged = []
+      for (const f of ['mentions.json', 'dm-seen.json']) {
+        try {
+          const p = join(stateDir, f)
+          if (existsSync(p)) { rmSync(p, { force: true }); purged.push(f) }
+        } catch { /* 删不掉就算了，不算失败 */ }
+      }
+      log(`已退出登录：凭证${removed ? '' : '（本来就没有）'}`
+        + (killedDm ? '，并停掉了正在跑的私信回复' : '')
+        + (purged.length ? '，清掉缓存 ' + purged.join('、') : ''))
+      return sendJson(res, 200, { ok: true, removed, killedDm, purged })
     }
 
     return sendJson(res, 404, { ok: false, error: `unknown ${req.method} ${path}` })
