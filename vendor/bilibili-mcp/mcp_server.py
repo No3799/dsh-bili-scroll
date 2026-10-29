@@ -941,10 +941,12 @@ def _nested_gate(target: dict, sample: list) -> tuple:
     if len(set(t)) <= 3:
         return ("那条评论基本是重复字符（刷屏式），不接。", "")
 
-    # ── ⑤ 整栋楼：样本够才判；不够就明确说「没判」，不能当成通过 ──
+    # ── ⑤ 整栋楼：**样本不够就不发**（不能嘴上说"没判断"、手上照发）──
     usable = [str(r.get("text") or "") for r in sample if str(r.get("text") or "").strip()]
     if len(usable) < _NESTED_MIN_SAMPLE:
-        return ("", f"样本不足（这楼只有 {len(usable)} 条可用回复，少于 {_NESTED_MIN_SAMPLE} 条）—— 未做整楼质量判断")
+        return (f"这楼只有 {len(usable)} 条回复，不到 {_NESTED_MIN_SAMPLE} 条 —— "
+                "没法判断整楼质量，这一次不回（宁可不回，也不在「没看过」的情况下发出去）。"
+                "换一栋回复多一点的楼，或者这一轮不回。", "")
     junk = 0
     for line in usable:
         lt = re.sub(r"_|[^\w]+", "", line, flags=re.UNICODE)
