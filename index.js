@@ -28,6 +28,10 @@ import { join, dirname } from 'node:path'
 import { createRequire } from 'node:module'
 import { fileURLToPath } from 'node:url'
 import { McpClient } from './lib/mcp.mjs'
+// ⭐ 2026-10-29：两条入口（值班轮 overlay / 内部 MCP）共用的 env 与重试判定，
+//    抽成纯函数放 lib 里，方便直接拿真值跑测试。
+import { mentionEnvFrom } from './lib/mention-env.mjs'
+import { dmRetryAllowed } from './lib/dm-retry.mjs'
 import { verifyRecent, appendVerifyToReport } from './lib/verify.mjs'
 import { WINDOWS, stateDirOf, readJson, writeJson, ensureHomeFiles, ensureCharter, charterPath, inWindow, dayKey, seenDay } from './lib/state.mjs'
 import { diagnoseRound } from './lib/diagnose.mjs'
@@ -540,7 +544,17 @@ function reportMeta() {
 
   let mcp = null
   let mcpKey = ''
-  const mcpKeyNow = () => `${cfg.pythonPath}|${join(stateDir, 'mcp_server.py')}`
+  /**
+   * ⭐ 2026-10-29（评审第 5 条）：**「怎么 @ 你」这套配置，两条入口必须拿到同一份**。
+   *   值班轮走 overlay 的 env；而插件自己起的这份内部 MCP（宿主工具 bili_reply 走它）
+   *   以前只传 uvEnv() —— 于是 BILI_MENTION_* 全是空的：
+   *     · `_MENTION_NESTED` 默认 False ⇒ **评论闸门在宿主这条路上根本不执行**
+   *     · `_MENTION_NAME` 空 ⇒ 连 @ 都不会补
+   *   现在统一走 lib/mention-env.mjs 里的纯函数，overlay 和内部 MCP 各调一次。
+   */
+  const mentionEnv = () => mentionEnvFrom(cfg, dmUidCache)
+  // ⭐ 配置变了要重建 MCP 进程（不然改了设置、闸门还是按旧配置跑）
+  const mcpKeyNow = () => `${cfg.pythonPath}|${join(stateDir, 'mcp_server.py')}|${JSON.stringify(mentionEnv())}`
 
   const ensureMcp = async () => {
     if (mcp?.running && mcpKey === mcpKeyNow()) return mcp
@@ -554,7 +568,8 @@ function reportMeta() {
       cwd: stateDir,                     // 凭证落在家里 ✓
       // ⭐ 这个内置的 Python MCP 会往 stdout 打中文（ensure_ascii=False）；
       //    Windows 默认 GBK 的话，中文/emoji 一进管道就可能炸 ⇒ 钉死 UTF-8
-      env: uvEnv(),
+      // ⭐ 2026-10-29：再把「怎么 @ 你」那套配置一起传下去 —— 跟值班轮 overlay 同一份
+      env: uvEnv({ ...mentionEnv() }),
       log,
     })
     return mcp
@@ -1507,11 +1522,8 @@ function reportMeta() {
         '          BILI_MCP_TOOLS: ' + yq(mcpWhitelist().join(',')),
         // ⭐ 2026-10-28 自定义：把「怎么 @」下沉给 Python 那一侧强制执行，
         //    不靠模型自觉 —— 它写错了这里会改写掉。
-        '          BILI_MENTION_MODE: ' + yq(String(cfg.mentionMode || 'top')),
-        '          BILI_MENTION_NAME: ' + yq(String(cfg.mentionName || '')),
-        '          BILI_MENTION_UID: ' + yq(String(Number(cfg.dmUid) > 0 ? Number(cfg.dmUid) : (Number(dmUidCache) > 0 ? Number(dmUidCache) : ''))),
-        // 「在有意思的评论下 @ 你」：独立开关，默认关
-        '          BILI_MENTION_NESTED: ' + yq(cfg.nestedMention && Number(cfg.nestedPerRound) > 0 ? '1' : ''),
+        // ⭐ 2026-10-29：跟内部 MCP 共用 mentionEnv()，两条入口永远同一份配置
+        ...Object.entries(mentionEnv()).map(([k, v]) => '          ' + k + ': ' + yq(String(v))),
         '',
       )
     }
@@ -2069,6 +2081,9 @@ function reportMeta() {
   }
 
   function runDmReply(fromUid, text) {
+    // ⭐ 2026-10-29：记下"哪一代"发起的。退出登录会把 dmRunEpoch 加一，
+    //    之后这个进程的失败回调就不再允许重新拉起自己。
+    const epoch = dmRunEpoch
     try {
       refreshCfg()
       const dsh = resolveDsh()
@@ -2105,10 +2120,21 @@ function reportMeta() {
           else log('⚠️ 没找到这次的会话 id ⇒ 下一条私信还是新会话（不影响回复，只是没上下文）')
         }
         // ② 带了 id 却失败（会话被删/迁移过）⇒ 丢掉它，下一条重开，别卡死在坏 id 上
+        // ⭐ 2026-10-29（评审第 7 条之二）：**退出登录期间不许重试**。
+        //   退出登录会把这个子进程 kill 掉 ⇒ 退出码非 0 ⇒ 走到这里 ⇒ 800ms 后又把它拉起来，
+        //   拿着已经删掉的凭证再跑一轮。用 epoch 标记"这一代已经作废"来挡住。
         if (savedSid && code !== 0) {
           writeDmSession('')
-          log('⚠️ 续会话失败（' + savedSid.slice(0, 16) + '…）⇒ 清掉 id，立刻用新会话重试一次（这条不能没回）')
-          setTimeout(() => { try { runDmReply(fromUid, text) } catch { /* 兜住 */ } }, 800)
+          if (!dmRetryAllowed(epoch, dmRunEpoch)) {
+            log('私信回复失败，但账号已经切换/退出登录 ⇒ 不再重试')
+          } else {
+            log('⚠️ 续会话失败（' + savedSid.slice(0, 16) + '…）⇒ 清掉 id，立刻用新会话重试一次（这条不能没回）')
+            dmRetryTimer = setTimeout(() => {
+              dmRetryTimer = null
+              if (!dmRetryAllowed(epoch, dmRunEpoch)) { log('私信重试被取消（账号已切换）'); return }
+              try { runDmReply(fromUid, text) } catch { /* 兜住 */ }
+            }, 800)
+          }
         }
       })
       return { ok: true }
@@ -2121,6 +2147,10 @@ function reportMeta() {
   let dmReplyRunning = false
   // ⭐ 2026-10-29（评审第 7 条）：私信回复子进程的句柄 —— 退出登录时要能停掉
   let dmChild = null
+  // ⭐ 2026-10-29：私信的"代号"与挂起的重试定时器。
+  //   退出登录 → dmRunEpoch++ ⇒ 旧进程的失败重试不再生效（否则杀掉它 800ms 后又被拉起来）
+  let dmRunEpoch = 0
+  let dmRetryTimer = null
   async function dmTick() {
     if (dmBusy) return
     dmBusy = true
@@ -3217,6 +3247,10 @@ function reportMeta() {
       //    只挡值班轮是不够的 —— 私信回复那个子进程也会拿着旧凭证继续回消息。
       if (dutyChild) return sendJson(res, 200, { ok: false, error: '正在跑一轮，等它跑完再退出登录' })
       let killedDm = false
+      // ⭐ 先立"这一代作废"的牌子，再杀进程：
+      //   否则 kill 之后进程以非 0 退出 → 触发"续会话失败重试" → 800ms 后又跑起来。
+      dmRunEpoch += 1
+      if (dmRetryTimer) { try { clearTimeout(dmRetryTimer) } catch { /* 无所谓 */ } dmRetryTimer = null }
       if (dmChild) {
         try { dmChild.kill(); killedDm = true } catch { /* 已经退了 */ }
         dmChild = null
