@@ -659,9 +659,11 @@ function WatchTab() {
             onChange: (e) => {
               const v = e.target.value
               setDmMode(v)
-              // ⭐ 2026-10-28：评论开关不再单独暴露，改由投递方式推导。
-              //    以前这里是两个独立开关 ⇒ 选「只发评论」而「自动评论」是关的，结果一条都不发。
-              patch({ dmMode: v, autoComment: v !== 'only' }, '投递方式')
+              /* ⭐ 2026-10-30：这里原来会顺手把 autoComment 设成 `v !== 'only'` —— 也就是
+               *   **用户只是换了个投递方式，就被自动打开了「拿他的号说话」**，而且切回「私信」
+               *   时又被关掉，把他自己设的值覆盖掉。现在只提交 dmMode 一个键，
+               *   autoComment 完全由用户自己决定；两者不一致时下面会有红字提示。 */
+              patch({ dmMode: v }, '投递方式')
             },
           },
             h('option', { value: 'only' }, '私信 —— 只发私信，评论区一句话都不说'),
@@ -671,12 +673,25 @@ function WatchTab() {
             (dmMode === 'off' || dmMode === 'both')
               ? '含「评论」的这两种，它才会在挑中的视频下面说话并 @ 你。'
               : '「私信」= 评论区一句话都不会说，所有东西都走私信。'),
-          /* ⚠️ 2026-10-29：宿主不再替用户打开 autoComment（那是拿用户的号说话），
-           *   所以选了含评论的投递方式、但评论开关是关的时候，得当面说清楚。 */
+          /* ⚠️ 2026-10-30：投递方式和「自动评论」现在是**两个独立的开关**（宿主不再替用户
+           *   打开 autoComment）。不一致的时候不能只提示、不给操作 —— 这里直接给个按钮。 */
           (dmMode === 'off' || dmMode === 'both') && !sw('autoComment')
             ? h('div', { 'data-bd-msg': '', 'data-warn': '' },
-              '⚠️ 你选了含评论的投递方式，但「自动评论」是关的 —— 现在它不会在评论区说话。'
-              + '把上面的投递方式重新选一次（或改回「私信」）即可同步；不想评论就保持现状。')
+              h('div', null, '⚠️ 你选了含评论的投递方式，但「自动评论」是关的 —— 现在它不会在评论区说话。'),
+              h('div', { 'data-bd-row': '' },
+                h('button', {
+                  'data-bd-btn': '', 'data-primary': '',
+                  onClick: () => patch({ autoComment: true }, '自动评论'),
+                }, '打开自动评论'),
+                h('button', {
+                  'data-bd-btn': '',
+                  onClick: () => patch({ dmMode: 'only' }, '投递方式'),
+                }, '改回只发私信')))
+            : null,
+          (dmMode === 'only' && sw('autoComment'))
+            ? h('div', { 'data-bd-msg': '', 'data-warn': '' },
+              '⚠️ 现在是「私信」模式，但「自动评论」还开着 —— 这一项会被忽略（私信模式不发公开评论）。'
+              + '想让它评论，把投递方式改成「评论」或「私信并评论」。')
             : null,
           h('div', { 'data-bd-label': '' }, '要 @ 谁 / 私信发给谁（B站 昵称）'),
           h('input', {
