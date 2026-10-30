@@ -1682,6 +1682,15 @@ function reportMeta() {
         dutyChild = null
       }
     refreshCfg()          // ⭐ 设置页刚改过的值要立刻生效（config 是就地改的，快照会过期）
+    // ⭐ 2026-10-30：**没登录就别跑了**。
+    //   实际踩到：连续两天每轮都照常启动，字幕/评论/私信接口全部返回"未登录"，
+    //   白花一整轮 token，报告里只留下一句"评论没发出去"。这里提前挡掉，
+    //   并且**不消费分时时间点**（调用方看到 started:false 会保留待执行）。
+    if (!hasCredential()) {
+      const msg = '这一轮没跑：还没扫码登录 B站。去 设置 → 刷B站 → 扫码登录。'
+      log(msg)
+      return { started: false, why, error: msg, needLogin: true }
+    }
     const dsh = resolveDsh()
     // ⭐ 找不到 dsh 就别硬跑：以前会退化成裸 `dsh` ⇒ spawn 失败、只留 exit 1 + 一串乱码 ✗
     if (dsh.missing) {
@@ -1893,7 +1902,15 @@ function reportMeta() {
    *    （`dsh: fatal uncaught exception`）。⇒ **定时器回调必须自己兜住所有异常**：
    *    插件再错也只该"这一轮没跑成"，绝不该杀宿主。
    */
+  // ⭐ 2026-10-30：tick 是 async 的（里面要 await 启动确认），加个防重入标记
+  let ticking = false
   const tick = async () => {
+    // ⭐ 2026-10-30：**防重入**。tick 现在是 async 的，里面有 `await runDutyConfirmed()`
+    //    （最长等 6 秒），而 setInterval 是 60 秒一跳 —— 平时够，但一旦机器卡顿、
+    //    或将来把确认窗口调大，就可能两跳叠在一起 ⇒ 同一分钟启动两轮。
+    //    runDuty 自己有锁兜底，但账（slots.done / windows 标记）会写乱，所以这里直接挡住。
+    if (ticking) return
+    ticking = true
     try {
       refreshCfg()                    // ⭐ 定时器活得比设置页久：每一跳都重新读一遍配置
       if (!cfg.peakValley) return
@@ -1944,7 +1961,11 @@ function reportMeta() {
         plan.done[idx] = true
         try { writeFileSync(slotsFile, JSON.stringify(plan, null, 2), 'utf8') } catch { /* 写不进去下一跳再说 */ }
         log(`分时到点（${why}）—— 这一轮只挑 1 条` + (skipped.length ? `（错过 ${skipped.length} 个点，已跳过）` : ''))
-        bumpState({ count: roundsToday(now) + 1, lastRunAt: now.toISOString(), lastActualRunAt: now.toISOString(), lastWhy: why })
+        // ⭐ 2026-10-30：**成功之后要把退避标记清掉**。以前只在失败时写 slotRetryAt、
+        //    从不删 —— 一旦某次启动失败过，这个时间戳会一直留到第二天，
+        //    只要它还没过期就一直挡住；更糟的是第二天跨天后 plan 重建、这个旧值仍在，
+        //    会让新一天的头几个点也被无谓地延后。成功就跑过之后它没有意义了。
+        bumpState({ count: roundsToday(now) + 1, lastRunAt: now.toISOString(), lastActualRunAt: now.toISOString(), lastWhy: why, slotRetryAt: '' })
         return
       }
       // ⭐ 「不写日报」那档没有报告可数 ⇒ 数不出条数就保守一点：一天只跑一轮
@@ -1965,6 +1986,8 @@ function reportMeta() {
       }
     } catch (e) {
       log(`定时器这一跳出错（已兜住，不影响宿主）：${e?.stack ?? e}`)
+    } finally {
+      ticking = false
     }
   }
 
