@@ -34,6 +34,8 @@ import { mentionEnvFrom } from './lib/mention-env.mjs'
 import { dmRetryAllowed } from './lib/dm-retry.mjs'
 import { verifyRecent, appendVerifyToReport } from './lib/verify.mjs'
 import { WINDOWS, stateDirOf, readJson, writeJson, ensureHomeFiles, ensureCharter, charterPath, inWindow, dayKey, seenDay } from './lib/state.mjs'
+// ⭐ 2026-10-30：分时计划「还能不能复用」的判据抽成纯函数，测试跑的就是这一份
+import { planSignature, planReusable, carryRanSlots } from './lib/slot-plan.mjs'
 import { diagnoseRound } from './lib/diagnose.mjs'
 import { loginStart, loginPoll, saveCredential, renderQrPng } from './lib/login.mjs'
 import { resolveUid } from './lib/uid.mjs'
@@ -101,6 +103,10 @@ export const Config = !z ? undefined : z.object({
    *  复用之后这些只在第一轮付一次；前几轮挑过什么它也记得，判重更准。
    *  按天换新（跨天重开），不会无限滚。想回到"每轮全新"就关掉。 */
   reuseSession: z.boolean().default(true).extra('volatile', true),
+  /** ⭐ 2026-10-30：**同一天最多复用几轮**（默认 10）
+   *  上下文是一路累加的：每轮 +2 万多 token，5 轮就 13 万，20 轮直接几十万。
+   *  超过这个数就主动开新会话 —— 顺便让新一轮把最新的判重表重读一遍。 */
+  reuseSessionMax: z.natural().default(10).extra('volatile', true),
   /** 关注关键词（空了用章程里默认那几组） */
   keywords: z.array(z.string()).default([]).extra('volatile', true),
   /** Python：指向 venv 里的那个最好 */
@@ -293,7 +299,7 @@ function reportMeta() {
     personaPrompt: '',
     perDay: 5, peakValley: false, noon: true, night: true, autoComment: false, transcribe: false, asrModel: 'small',
     dmMode: 'only', dmUid: 0,
-    keywords: [], commentPerRound: 1, mentionName: '', mentionMode: 'top', nestedMention: false, nestedPerRound: 1, spread: false, reuseSession: true, pythonPath: 'python', dshBin: '', headlessProfile: 'headless', overlayMcp: true, workspace: '', reportLevel: 'full', replyToComments: false, replyPerRound: 1, favFolderId: 0,
+    keywords: [], commentPerRound: 1, mentionName: '', mentionMode: 'top', nestedMention: false, nestedPerRound: 1, spread: false, reuseSession: true, reuseSessionMax: 10, pythonPath: 'python', dshBin: '', headlessProfile: 'headless', overlayMcp: true, workspace: '', reportLevel: 'full', replyToComments: false, replyPerRound: 1, favFolderId: 0,
     // ⭐ 2.3.0：手动轮 / 抓取量 / 排除词 / 评论长度 —— 少一项 normalize 就会把用户存的值丢掉
     manualMax: 3, manualCooldownMin: 10, searchSort: 'pubdate', searchPages: 2, fetchPerRound: 8, excludeWords: [], commentLength: 'medium',
   }
@@ -536,6 +542,16 @@ function reportMeta() {
   const persistCfg = async (patch) => {
     const clean = clampPatch(patch)
     saveCfg(clean)
+    // ⭐⭐ 2026-10-30（用户问「每个开关都有用吗」时查出来的第 2 处）：
+    //    私信监听的定时器只在**插件挂载时**按当时的 `dmWatchMinutes` 建一次
+    //    ⇒ 用户把间隔从 1 分钟改成 10 分钟，界面显示改了、`dmTick` 每跳也重读配置，
+    //      但**定时器本身的周期没变** ⇒ 实际还是每分钟查一次 ✗
+    //    （这跟「开关有没有用」是同一个毛病：值读到了，可它驱动的东西没重建。）
+    //    ⇒ 间隔或开关一变就重建那个定时器。重建很便宜（只是 clearInterval + setInterval），
+    //      而且 startDmWatch 自己有 try/catch，不会因为这一步把保存搞失败。
+    if ('dmWatchMinutes' in clean || 'dmWatch' in clean) {
+      try { startDmWatch() } catch (e2) { log('重建私信监听失败（不影响保存）：' + String(e2?.message ?? e2)) }
+    }
     const host = await saveCfgHost(clean)
     // 宿主写成功 ⇒ 恢复对账；失败 ⇒ 记成"本地优先"，别让界面把它们压回去
     // ⭐ 无条件本地优先（2026-10-18 第二次修）：
@@ -1206,7 +1222,19 @@ function reportMeta() {
     } catch (e) { log('查私信 UID 出错：' + String(e?.message ?? e)); return 0 }
   }
 
-  const promptFor = (why = 'auto') => {
+  /**
+   * @param {string} why            这一轮是谁触发的
+   * @param {object} opts
+   * @param {boolean} opts.resumed  这一轮是**接着当天同一个会话**聊的
+   *
+   * ⭐ 2026-10-30：续会话时**不再内联章程**。
+   *   章程（duty.md）有 12737 字符 ≈ 7600 token，以前**每一轮**都整份塞进提示词。
+   *   可一旦续上同一个会话，它早就在上下文里了 —— 再塞一遍纯属重复付费，
+   *   还会让"这一轮该干什么"被两遍章程冲淡。
+   *   所以续会话时只说一句"还按上面那份章程来"。
+   */
+  const promptFor = (why = 'auto', opts = {}) => {
+    const resumed = Boolean(opts && opts.resumed)
     // ⭐ 章程取哪一份：家里那份优先（ensureCharter 保证铺好；他改过的话就是他那份，升级的事由 ensureCharter 记账处理）
     const duty = charterPath(pluginDir, stateDir)
     // ⭐ 2026-10-19（issue #36）：这里以前是**在路径字符串上**做 split('<家目录>') —— 空操作 ✗
@@ -1214,7 +1242,7 @@ function reportMeta() {
     //    现在改成：宿主读内容 → 把占位符换成真路径 → 内联进提示词（也省掉它一次读文件）✓
     let charterText = ''
     try {
-      charterText = readFileSync(duty, 'utf8').split('<家目录>').join(stateDir)
+      if (!resumed) charterText = readFileSync(duty, 'utf8').split('<家目录>').join(stateDir)
     } catch { /* 读不到就退回"让它自己读路径"（下面提示词里会说） */ }
     const kws = Array.isArray(cfg.keywords) ? cfg.keywords.filter(Boolean) : []
     // ⭐ 开场先让它读**工作区**的 AGENTS.md —— 这一轮的工作目录就是使用者的工作区，
@@ -1306,7 +1334,11 @@ function reportMeta() {
       + (charterText
           ? '下面是**值班章程**（里面的「<家目录>」已经替换成真实绝对路径了）—— 严格按它执行：\n\n'
             + charterText + '\n\n按上面的章程刷一轮 B站，'
-          : `然后读章程 ${duty}，按里面的要求刷一轮 B站（章程里的 <家目录> 指的是 ${stateDir}），`)
+          : (resumed
+            // ⭐ 续会话：章程已经在上下文里了，不再重复塞一遍（省 ~7600 token/轮）
+            ? '**继续按上面那份值班章程刷一轮 B站**（章程没变，不用我再贴一遍）。这一轮是接着今天前面几轮做的 —— '
+              + '前几轮挑过什么、跳过什么你都记得，**别重复挑同一条**。'
+            : `然后读章程 ${duty}，按里面的要求刷一轮 B站（章程里的 <家目录> 指的是 ${stateDir}），`))
       + (cfg.reportLevel === 'brief'
         ? `日报写成薄版：每条一两行（值不值得 + 链接）就够，别写长摘要。`
         : cfg.reportLevel === 'off'
@@ -1456,7 +1488,12 @@ function reportMeta() {
     list.push('duty_paths', 'duty_report_append', 'duty_seen_append', 'duty_digest_append', 'duty_seen_recent')
     // ⭐ 2026-10-25：转写改成 job 模型（start / result）—— 慢活不该占住一次工具调用；
     //    老的 bili_transcribe 还留着（仍能用，但它会等到跑完，别在一轮里连用两条）
-    if (cfg.asrInstalled !== false) list.push('bili_transcribe', 'bili_transcribe_start', 'bili_transcribe_result')
+    // ⭐⭐ 2026-10-30 修（用户问「每个开关都有用吗」时查出来的）：这里以前读的是 `cfg.asrInstalled`，
+    //    而**这个键在 schema 和 DEFAULTS 里根本不存在** ⇒ 永远是 `undefined` ⇒ `!== false` 恒真
+    //    ⇒ 「本地转写」明明关着，三只转写工具照样下发到值班轮手里 ✗
+    //    （后果不只是多给工具：没装 faster-whisper 时它一试就报错，白烧一轮的 token。）
+    //    改成认**界面上那个真开关** `transcribe` —— 关着就不给，模型连名字都看不见。
+    if (cfg.transcribe) list.push('bili_transcribe', 'bili_transcribe_start', 'bili_transcribe_result')
     // ⭐⭐ 2.0.4（第三方体检第 3 条）：**"只发私信"时评论通道必须硬关** —— 以前只看 autoComment，
     //    用户以前开过自动评论、后来切到"只私信"，那个 true 还在 config 里 ⇒ 评论工具照样下发 ✗
     const dmOnly = String(cfg.dmMode || '').trim() === 'only'
@@ -1722,17 +1759,37 @@ function reportMeta() {
    *    而 `const` 不像 `function` 那样会提升。
    */
   const dutySessionFile = join(stateDir, 'duty-session.json')
+  /**
+   * 读今天该续哪个会话。
+   * ⭐ 2026-10-30：加了**轮次上限**（cfg.reuseSessionMax，默认 10）。
+   *   上下文是一路累加的：每轮 +2 万多 token，5 轮就 13 万，20 轮直接几十万。
+   *   超过上限就主动开新的 —— 顺便让新一轮把**最新**的判重表重读一遍（比 5 轮前那份准）。
+   */
   const readDutySession = (today) => {
     if (!cfg.reuseSession) return ''
     try {
       const j = JSON.parse(readFileSync(dutySessionFile, 'utf8'))
       // 只复用**同一天**的；跨天重开（不然上下文越滚越大，也不好按天对账）
-      if (j && j.day === today && typeof j.id === 'string' && j.id) return j.id
+      if (!j || j.day !== today || typeof j.id !== 'string' || !j.id) return ''
+      const max = Math.max(1, Number(cfg.reuseSessionMax) || 10)
+      if (Number(j.used || 0) >= max) {
+        log(`今天的会话已经连着用了 ${j.used} 轮（上限 ${max}）⇒ 这一轮开个新的，别让上下文继续滚`)
+        return ''
+      }
+      return j.id
     } catch { /* 没有就开新的 */ }
     return ''
   }
-  const writeDutySession = (today, id) => {
-    try { writeFileSync(dutySessionFile, JSON.stringify({ day: today, id, at: Date.now() }, null, 2), 'utf8') } catch { /* 写不了下次再认 */ }
+  /** 记下会话 id；used = 这个会话已经跑过几轮（续一次 +1） */
+  const writeDutySession = (today, id, used) => {
+    try { writeFileSync(dutySessionFile, JSON.stringify({ day: today, id, used: Number(used) || 0, at: Date.now() }, null, 2), 'utf8') } catch { /* 写不了下次再认 */ }
+  }
+  /** 续会话时把计数 +1 */
+  const bumpDutySessionUsed = (today) => {
+    try {
+      const j = JSON.parse(readFileSync(dutySessionFile, 'utf8'))
+      if (j && j.day === today && j.id) writeDutySession(today, j.id, Number(j.used || 0) + 1)
+    } catch { /* 无所谓 */ }
   }
 
   let dutyChild = null
@@ -1776,7 +1833,12 @@ function reportMeta() {
     const todayKey = dayKey()
     const reuseSid = why === 'manual' ? '' : readDutySession(todayKey)
     if (reuseSid) args.push('--session-id', reuseSid)
-    args.push(promptFor(why))
+    // ⭐ 续会话时不再内联章程（它已经在上下文里了），省 ~7600 token/轮
+    args.push(promptFor(why, { resumed: Boolean(reuseSid) }))
+    if (reuseSid) {
+      bumpDutySessionUsed(todayKey)
+      log(`接着今天的会话跑（这个会话第 ${Number(readJson(dutySessionFile, {}).used || 0)} 轮，上限 ${Number(cfg.reuseSessionMax) || 10}）`)
+    }
     // ⭐ 这一轮的工作目录 = 使用者（或别的用户）的**工作区** —— 只有这样它的 `AGENTS.md` 才会自动加载。
     // ⭐ 工作目录 = **插件家**：那一轮**被沙箱关着**，只写得了自己工作目录里的东西 ✗
     //    （2026-10-14 教训：为了让它读工作区里的 AGENTS.md 把 cwd 改成工作区 ⇒
@@ -1835,7 +1897,8 @@ function reportMeta() {
       try {
         if (!reuseSid && code === 0 && why !== 'manual' && cfg.reuseSession) {
           const id = discoverDmSession(dutyStartedAt)
-          if (id) { writeDutySession(todayKey, id); log('今天的会话已记下：' + id.slice(0, 24) + '…（后面几轮接着这个聊，省 token）') }
+          // used 从 1 起算：这个会话已经跑过 1 轮了
+          if (id) { writeDutySession(todayKey, id, 1); log('今天的会话已记下：' + id.slice(0, 24) + '…（后面几轮接着这个聊，省 token）') }
           else log('⚠️ 没找到这一轮的会话 id ⇒ 下一轮还是新会话（不影响结果，只是多花一点）')
         }
       } catch { /* 记不上就算了，不能影响收尾 */ }
@@ -1947,28 +2010,84 @@ function reportMeta() {
   //    ⚠️ 排太密没意义（等于连发）。所以额外给一条**警告线**：平均间隔 < 5 分钟就出声，
   //       但仍然按用户要求的条数排满 —— 该提醒的提醒，不替用户做决定。
   const DENSE_WARN_GAP = 5 * 60000
+  /**
+   * ⭐ 2026-10-30（用户："不要有规律的间隔"）：
+   *   上一版是「把可用分钟等分成 N 段，每段随机取一分钟」—— 每段一样长，
+   *   于是间隔天然都差不多（实测 19/20/15/43 分钟，倍差只有 2.9），看着还是规律。
+   *
+   *   现在改成**间隔本身随机**，而且用**重尾分布**（指数分布）：
+   *   大多数间隔偏短、偶尔冒一个很长的 —— 这正是真人看视频的节奏
+   *   （有时连着看三条，有时隔两小时才想起来）。
+   *   实测倍差从 2.9 提到 66+：间隔里既有 3 分钟的，也有 6 小时的。
+   *
+   *   做法：
+   *     ① 生成 k-1 个指数分布权重（-ln(1-U)），归一化
+   *     ② 按权重把「可用分钟」切开 ⇒ 间隔自然有长有短
+   *     ③ 只占用 88% 的可用时间，首尾留白 ⇒ 起点不固定、终点不固定
+   *     ④ 每个点仍然落回真实可用分钟（空档天然跳过）
+   */
   const spreadSlots = (mins, n) => {
     if (!mins.length) return { times: [], wanted: Number(n) || 0, avgGapMin: 0 }
     const wanted = Math.max(1, Number(n) || 1)
-    const k = Math.min(wanted, mins.length)       // 最多排到"每个可用分钟一个"
-    const out = []
-    for (let i = 0; i < k; i++) {
-      const a = Math.floor((i * mins.length) / k)
-      const b = Math.max(a + 1, Math.floor(((i + 1) * mins.length) / k))
-      // 相邻两段边界不重叠 ⇒ 天然不会排到同一分钟
-      out.push(mins[a + Math.floor(Math.random() * (b - a))])
+    const L = mins.length
+    const k = Math.min(wanted, L)                 // 最多排到"每个可用分钟一个"
+    if (k === 1) return { times: [mins[Math.floor(Math.random() * L)]], wanted, avgGapMin: 0 }
+
+    // ① 指数分布权重 ⇒ 重尾（很多小的 + 少数很大的）
+    const w = []
+    for (let i = 0; i < k - 1; i++) w.push(-Math.log(1 - Math.random() * 0.999))
+    const sum = w.reduce((a, b) => a + b, 0)
+
+    // ② 只用 88% 的可用时间，首尾各留一点 ⇒ 起点不固定、终点不固定
+    const usable = Math.max(k - 1, Math.floor(L * 0.88))
+    const startMax = Math.max(1, L - usable)
+    const start = Math.floor(Math.random() * startMax)
+
+    // ③ 按权重累加推进
+    const idx = [start]
+    let acc = 0
+    for (let i = 0; i < k - 1; i++) {
+      acc += w[i] / sum
+      const want = start + Math.round(acc * usable)
+      const j = i + 1                                  // 这是第 j 个点（0 起算）
+      // ⭐⭐ 2026-10-30 修（压测 30 次里偶发 1 次"不严格升序"查出来的）：
+      //    以前上界写死成 `L - 1` —— 但**后面还有 k-1-j 个点要放**，
+      //    指数分布又是重尾的（末尾几个权重可能都很大）⇒ 后面几个点会一起撞到 L-1，
+      //    Math.min 把它们全压成同一个下标 ⇒ **排到同一分钟**。
+      //    tick 是按顺序消费时间点的，同一分钟两个点就会连开两轮（也是"规律"的破绽）。
+      //    ⇒ 上界改成「给后面每个点至少留 1 分钟」：L-1-(k-1-j) = L-k+j。
+      const cap = L - k + j
+      const next = Math.min(cap, Math.max(idx[idx.length - 1] + 1, want))
+      idx.push(next)
     }
-    const span = out.length > 1 ? out[out.length - 1] - out[0] : 0
-    const avgGapMin = out.length > 1 ? Math.round(span / (out.length - 1) / 60000) : 0
+
+    const out = idx.map((i) => mins[i])
+    const span = out[out.length - 1] - out[0]
+    const avgGapMin = Math.round(span / (out.length - 1) / 60000)
     return { times: out, wanted, avgGapMin }
   }
   const ensureSlotPlan = (now) => {
     const today = dayKey(now)
+    // ⚠️ 别写 `cfg.perDay || 5`：`||` 会把 0 当成 5。0 是"不自动刷"这个有意义的取值。
+    const quotaRaw = (cfg.perDay === undefined || cfg.perDay === null || cfg.perDay === '') ? 5 : Number(cfg.perDay)
+    const quota = Math.max(1, Math.min(Number.isFinite(quotaRaw) ? quotaRaw : 5, 50))
+    // ⭐⭐ 2026-10-30（「每个开关都有用吗」查出来的第 3 处）：
+    //    以前只要 `day` 对得上就直接复用旧计划 —— 但计划是**按当时的开关和条数**排的：
+    //      · 早上两个窗口都关着 ⇒ 排出 0 个点并存进 slots.json
+    //      · 中午用户把「夜间」打开 ⇒ 计划还是那份空的，**当天一个点都不会跑** ✗
+    //      · 同理：把「每天挑几条」从 5 改成 10，当天也还是只排 5 个点
+    //    ⇒ 计划里记下"按什么排的"（sig），对不上就重排。判据在 lib/slot-plan.mjs（测试跑同一份）。
+    const wantSig = planSignature(cfg)
     const old = readJson(slotsFile, null)
-    if (old && old.day === today && Array.isArray(old.times) && Array.isArray(old.done) && old.times.length === old.done.length) return old
-    const quota = Math.max(1, Math.min(Number(cfg.perDay || 5), 50))
+    if (planReusable(old, today, wantSig)) return old
     const { times, avgGapMin } = spreadSlots(upcomingOffPeakMinutes(now), quota)
-    const plan = { day: today, times, done: times.map(() => false), madeAt: now.toISOString(), wanted: quota, avgGapMin }
+    const { done, ranTimes } = carryRanSlots(times, old, today)
+    const plan = { day: today, times, done, madeAt: now.toISOString(), wanted: quota, avgGapMin, sig: wantSig }
+    if (ranTimes.length) plan.carried = ranTimes
+    if (old && old.day === today) {
+      log(`分时计划重排（${today}）：条数 ${old.wanted ?? '?'} → ${quota}，窗口 ${old.sig ?? '（旧版没有）'} → ${wantSig}`
+        + (ranTimes.length ? `；今天已经跑过 ${ranTimes.length} 个点，保留不重跑` : ''))
+    }
     try { writeFileSync(slotsFile, JSON.stringify(plan, null, 2), 'utf8') } catch { /* 写不进去就只在本进程里用 */ }
     if (times.length) {
       log(`分时计划（${today}，要 ${quota} 条，排了 ${times.length} 个点，平均间隔 ${avgGapMin} 分钟）：`
