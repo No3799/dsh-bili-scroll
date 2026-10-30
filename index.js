@@ -96,6 +96,11 @@ export const Config = !z ? undefined : z.object({
    *  ⚠️ 2026-10-29（评审第 3 条）：**默认改成 false**。它是新行为，不该在升级时
    *  悄悄改变老用户"每个谷时窗口跑一轮"的节奏 —— 想要的人自己去设置页打开。 */
   spread: z.boolean().default(false).extra('volatile', true),
+  /** ⭐ 2026-10-30：**当天复用同一个会话**（默认开）
+   *  一天要跑好几轮，每轮都开新会话 ⇒ 章程（16KB）、人设、AGENTS.md 每次都要重新进上下文。
+   *  复用之后这些只在第一轮付一次；前几轮挑过什么它也记得，判重更准。
+   *  按天换新（跨天重开），不会无限滚。想回到"每轮全新"就关掉。 */
+  reuseSession: z.boolean().default(true).extra('volatile', true),
   /** 关注关键词（空了用章程里默认那几组） */
   keywords: z.array(z.string()).default([]).extra('volatile', true),
   /** Python：指向 venv 里的那个最好 */
@@ -288,7 +293,7 @@ function reportMeta() {
     personaPrompt: '',
     perDay: 5, peakValley: false, noon: true, night: true, autoComment: false, transcribe: false, asrModel: 'small',
     dmMode: 'only', dmUid: 0,
-    keywords: [], commentPerRound: 1, mentionName: '', mentionMode: 'top', nestedMention: false, nestedPerRound: 1, spread: false, pythonPath: 'python', dshBin: '', headlessProfile: 'headless', overlayMcp: true, workspace: '', reportLevel: 'full', replyToComments: false, replyPerRound: 1, favFolderId: 0,
+    keywords: [], commentPerRound: 1, mentionName: '', mentionMode: 'top', nestedMention: false, nestedPerRound: 1, spread: false, reuseSession: true, pythonPath: 'python', dshBin: '', headlessProfile: 'headless', overlayMcp: true, workspace: '', reportLevel: 'full', replyToComments: false, replyPerRound: 1, favFolderId: 0,
     // ⭐ 2.3.0：手动轮 / 抓取量 / 排除词 / 评论长度 —— 少一项 normalize 就会把用户存的值丢掉
     manualMax: 3, manualCooldownMin: 10, searchSort: 'pubdate', searchPages: 2, fetchPerRound: 8, excludeWords: [], commentLength: 'medium',
   }
@@ -1700,6 +1705,36 @@ function reportMeta() {
     } catch { /* 没有锁 / 读不出来 / 写不进去都无所谓，靠 10 分钟过期兜底 */ }
   }
 
+  /* ⭐ 2026-10-30：**当天所有值班轮复用同一个会话。**
+   *
+   * 用户问的：「每次都会开个新对话，当天的都放在一个对话里会不会省一点」—— 会。
+   *
+   * 以前每轮都是全新会话 ⇒ 每一轮都要**重新读一遍章程（duty.md，16KB）+ 提示词**，
+   * 而这几轮干的是同一件事（读字幕、判断、写报告）。同一天复用之后：
+   *   · 章程、人设、AGENTS.md 只在第一轮进一次上下文，后面接着聊
+   *   · 前几轮挑过什么、为什么跳过，它自己记得 ⇒ 判重更准，也更像"同一个人连着看"
+   *   · 上下文太长时 DSH 会自己压缩（headless 支持 --session-id，历史由它带）
+   *
+   * 但**不能无限复用**：上下文越滚越贵，而且一轮跑歪了会污染后面几轮。
+   * 所以按**天**换新（跨天就开新的），并且留一个开关给想关掉的人。
+   *
+   * ⚠️ 这几个函数必须定义在 runDuty **之前** —— runDuty 里直接调用它们，
+   *    而 `const` 不像 `function` 那样会提升。
+   */
+  const dutySessionFile = join(stateDir, 'duty-session.json')
+  const readDutySession = (today) => {
+    if (!cfg.reuseSession) return ''
+    try {
+      const j = JSON.parse(readFileSync(dutySessionFile, 'utf8'))
+      // 只复用**同一天**的；跨天重开（不然上下文越滚越大，也不好按天对账）
+      if (j && j.day === today && typeof j.id === 'string' && j.id) return j.id
+    } catch { /* 没有就开新的 */ }
+    return ''
+  }
+  const writeDutySession = (today, id) => {
+    try { writeFileSync(dutySessionFile, JSON.stringify({ day: today, id, at: Date.now() }, null, 2), 'utf8') } catch { /* 写不了下次再认 */ }
+  }
+
   let dutyChild = null
   let dutyStartedAt = 0
   const runDuty = (why = 'window') => {
@@ -1735,6 +1770,12 @@ function reportMeta() {
     const overlay = ensureOverlay()
       const args = [...dsh.args, '--profile', effectiveProfile()]
     if (overlay) args.push('--patch', overlay)
+    // ⭐ 2026-10-30：**同一天复用同一个会话**（省 token，也让判重更准）。
+    //    手动轮不续 —— 用户手动跑往往是想"干净地看一眼现在什么情况"，
+    //    接在前面几轮的上下文后面反而容易被带偏。
+    const todayKey = dayKey()
+    const reuseSid = why === 'manual' ? '' : readDutySession(todayKey)
+    if (reuseSid) args.push('--session-id', reuseSid)
     args.push(promptFor(why))
     // ⭐ 这一轮的工作目录 = 使用者（或别的用户）的**工作区** —— 只有这样它的 `AGENTS.md` 才会自动加载。
     // ⭐ 工作目录 = **插件家**：那一轮**被沙箱关着**，只写得了自己工作目录里的东西 ✗
@@ -1789,6 +1830,15 @@ function reportMeta() {
     child.on('exit', (code) => {
       releaseRunLock()            // ⭐ 这一轮结束了，把锁放开（删不掉也没事，10 分钟自动过期）
       log(`刷B站结束（${why}，code=${code}）`)
+      // ⭐ 2026-10-30：把这一轮开出来的会话 id 记下来，供**当天后续几轮**接着用。
+      //    没续上（比如第一轮）才需要认领；已经续着的就沿用，不用再找。
+      try {
+        if (!reuseSid && code === 0 && why !== 'manual' && cfg.reuseSession) {
+          const id = discoverDmSession(dutyStartedAt)
+          if (id) { writeDutySession(todayKey, id); log('今天的会话已记下：' + id.slice(0, 24) + '…（后面几轮接着这个聊，省 token）') }
+          else log('⚠️ 没找到这一轮的会话 id ⇒ 下一轮还是新会话（不影响结果，只是多花一点）')
+        }
+      } catch { /* 记不上就算了，不能影响收尾 */ }
       stubReportIfMissing(code)   // ⭐ 没写报告就补一份占位 —— 别让使用者什么都看不到
       try { writeRoundNotesToReport() } catch { /* 写不进去也不能炸 */ }
     // ⭐ 2026-10-20：这一轮跑成了、并且使用者选了收藏夹 ⇒ 把挑中的存进去（后台做，别拖住收尾）
@@ -1881,46 +1931,56 @@ function reportMeta() {
     }
     return out
   }
-  // ⭐ 分时排点：**只在真正可用的分钟里按比例抽**，相邻两点至少隔 MIN_SLOT_GAP。
+  // ⭐ 分时排点：**只在真正可用的分钟里按比例抽**，相邻两点至少隔 minGap。
   //    ⚠️ 2026-10-28 修：以前是"把 12:00–23:59 按时间轴切段、每段随机取一个、再吸附到最近的可用分钟"。
   //    但中午 12–14 与夜间 18–09 之间那段 14–18 是空的（正峰时），而第二段恰好横跨空白
   //    ⇒ 随机目标落进空档、吸附到最近的边界 ⇒ **每天第二个点都卡在 18:00 整**，
   //    比固定时间还机械，跟"随机"的目的正好相反（实测连续五天全是 18:00）。
   //    现在改成按"可用分钟列表"分片：空档天然不存在，吸附这一步也就不需要了。
-  const MIN_SLOT_GAP = 20 * 60000
+  //
+  //    ⭐ 2026-10-30（用户："我给了多少条，你就在我给的时间里跑完"）：
+  //       改成**按"可用分钟列表的下标"均分** —— 每个点从自己那一段里随机取一分钟。
+  //       这样不管可用时间是连续的 2 小时，还是"中午+夜间"两段拼起来，都能排满 N 个点。
+  //       （之前按 `总时长 / 条数` 算间隔，碰上中间有空档必然排不满：12 小时 ÷ 20 条
+  //         算出 36 分钟间隔，可真正能用的只有 8 小时，于是只排得出 12 个点。）
+  //
+  //    ⚠️ 排太密没意义（等于连发）。所以额外给一条**警告线**：平均间隔 < 5 分钟就出声，
+  //       但仍然按用户要求的条数排满 —— 该提醒的提醒，不替用户做决定。
+  const DENSE_WARN_GAP = 5 * 60000
   const spreadSlots = (mins, n) => {
-    if (!mins.length) return []
-    // 可用时间太短就自动少排几个点（宁少不挤）
-    const k = Math.min(
-      Math.max(1, Number(n) || 1),
-      Math.max(1, Math.floor((mins[mins.length - 1] - mins[0]) / MIN_SLOT_GAP) + 1),
-    )
+    if (!mins.length) return { times: [], wanted: Number(n) || 0, avgGapMin: 0 }
+    const wanted = Math.max(1, Number(n) || 1)
+    const k = Math.min(wanted, mins.length)       // 最多排到"每个可用分钟一个"
     const out = []
-    let pool = mins.slice()
     for (let i = 0; i < k; i++) {
-      const remain = k - i                        // 含这一次，后面还要放 remain-1 个
-      const minT = out.length ? out[out.length - 1] + MIN_SLOT_GAP : -Infinity
-      const cand = pool.filter((m) => m >= minT)
-      if (!cand.length) break
-      // 只从「剩余可用时间的前 1/remain」里随机 ⇒ 天然摊开，又给后面留够位置
-      const take = Math.max(1, Math.ceil(cand.length / remain))
-      const pick = cand[Math.floor(Math.random() * take)]
-      out.push(pick)
-      pool = cand.filter((m) => m >= pick + MIN_SLOT_GAP)
+      const a = Math.floor((i * mins.length) / k)
+      const b = Math.max(a + 1, Math.floor(((i + 1) * mins.length) / k))
+      // 相邻两段边界不重叠 ⇒ 天然不会排到同一分钟
+      out.push(mins[a + Math.floor(Math.random() * (b - a))])
     }
-    return out
+    const span = out.length > 1 ? out[out.length - 1] - out[0] : 0
+    const avgGapMin = out.length > 1 ? Math.round(span / (out.length - 1) / 60000) : 0
+    return { times: out, wanted, avgGapMin }
   }
   const ensureSlotPlan = (now) => {
     const today = dayKey(now)
     const old = readJson(slotsFile, null)
     if (old && old.day === today && Array.isArray(old.times) && Array.isArray(old.done) && old.times.length === old.done.length) return old
     const quota = Math.max(1, Math.min(Number(cfg.perDay || 5), 50))
-    const times = spreadSlots(upcomingOffPeakMinutes(now), quota)
-    const plan = { day: today, times, done: times.map(() => false), madeAt: now.toISOString() }
+    const { times, avgGapMin } = spreadSlots(upcomingOffPeakMinutes(now), quota)
+    const plan = { day: today, times, done: times.map(() => false), madeAt: now.toISOString(), wanted: quota, avgGapMin }
     try { writeFileSync(slotsFile, JSON.stringify(plan, null, 2), 'utf8') } catch { /* 写不进去就只在本进程里用 */ }
     if (times.length) {
-      log(`分时计划（${today}，共 ${times.length} 个时间点）：`
+      log(`分时计划（${today}，要 ${quota} 条，排了 ${times.length} 个点，平均间隔 ${avgGapMin} 分钟）：`
         + times.map((t) => new Date(t).toTimeString().slice(0, 5)).join(' / '))
+      // ⭐ 2026-10-30：排太密要出声（但仍然按用户要求排满 —— 该提醒的提醒，不替他决定）
+      if (times.length > 1 && avgGapMin * 60000 < DENSE_WARN_GAP) {
+        log(`⚠️ 太密了：平均 ${avgGapMin} 分钟一轮，等于连着发。`
+          + `想让间隔拉开，要么把条数降下来，要么把「夜间」窗口也打开（可用时长从 2 小时变成 8 小时）。`)
+      }
+      if (times.length < quota) {
+        log(`⚠️ 排不满：要 ${quota} 条，可用分钟只够 ${times.length} 个点。`)
+      }
     } else {
       log(`分时计划（${today}）：今天剩下的时间里没有可用的谷时窗口（检查「中午/夜间」开关和时间段）`)
     }
@@ -1969,9 +2029,15 @@ function reportMeta() {
         // 还在允许的谷时窗口里吗？（周末全天算谷时；两个窗口都关 = 压根不该跑）
         const anyWindow = ['noon', 'night'].some((k) => cfg[k] && inWindow(now, WINDOWS[k]))
         if (!anyWindow) return                       // 不在允许时段：不消费，等下一个窗口
-        // 按「实际启动时间」卡最小间隔
+        // 按「实际启动时间」卡最小间隔。
+        // ⭐ 2026-10-30：这个间隔不再写死 —— 用计划里算出来的「平均间隔」的一半作下限。
+        //    为什么取一半：计划本身是"每段随机取一个"，实际间隔天然会有波动（有的 30 分、
+        //    有的 15 分）。卡满平均间隔会把合法的短间隔也挡掉，反而少跑几轮。
+        //    取一半既能挡住"同一分钟连开两轮"，又不会误伤正常波动。
+        const planGapMs = Number(plan.avgGapMin || 0) * 60000
+        const minGapMs = Math.max(60000, Math.floor(planGapMs / 2))   // 至少 1 分钟
         const lastActual = st.lastActualRunAt ? new Date(st.lastActualRunAt).getTime() : 0
-        if (lastActual && now.getTime() - lastActual < MIN_SLOT_GAP) return
+        if (lastActual && now.getTime() - lastActual < minGapMs) return
         // 上次启动失败过？退避 10 分钟，别每 60 秒硬试一次
         const retryAt = st.slotRetryAt ? new Date(st.slotRetryAt).getTime() : 0
         if (retryAt && now.getTime() < retryAt) return
@@ -2112,6 +2178,9 @@ function reportMeta() {
       return best
     } catch { return '' }
   }
+
+  /* ⭐ 2026-10-30：会话复用的读写函数定义在 runDuty 之前（见文件上方 dutySessionFile 那段），
+   *   这里不再重复定义 —— 重复 `const` 会直接抛 SyntaxError。 */
 
   function dmPromptFor(fromUid, text) {
     const raw = String(text || '').slice(0, 600)
