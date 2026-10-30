@@ -90,3 +90,26 @@ test('avgGapMin 反映真实密度（用来触发"太密"警告）', () => {
   assert.ok(rt.avgGapMin < 5, '30 分钟排 20 条应该判为太密，实际 ' + rt.avgGapMin)
   assert.ok(/DENSE_WARN_GAP/.test(INDEX), '没有太密警告的阈值常量')
 })
+
+/* ⭐ 2026-10-30（用户拍板选 A）：**太密只警告、不拦。**
+ *   所以这里钉死两件事：
+ *     ① ensureSlotPlan 里"太密"那段只有 log，没有 return / throw（不能悄悄少排）
+ *     ② 排点函数本身对"条数 > 窗口能舒服容纳的量"也不设上限（除了可用分钟数）
+ *   哪天有人想改成"拒绝"，必须同时改这个测试 —— 那是一次产品决策，不该被顺手改掉。
+ */
+test('太密只警告、不拦：ensureSlotPlan 里那段不许 return', () => {
+  const start = INDEX.indexOf('DENSE_WARN_GAP) {')
+  assert.ok(start > 0, '没找到太密判断')
+  const block = INDEX.slice(start, start + 400)
+  const braceEnd = block.indexOf('}')
+  const body = block.slice(block.indexOf('{') + 1, braceEnd)
+  assert.equal(/\breturn\b/.test(body), false, '太密那段出现了 return —— 变成"拦"了')
+  assert.equal(/\bthrow\b/.test(body), false, '太密那段出现了 throw')
+  assert.ok(/log\(/.test(body), '太密那段应该 log 一句')
+})
+
+test('只开中午要 20 条：一条不少地排满（A 方案的核心承诺）', () => {
+  const r = spreadSlots(noon, 20)
+  assert.equal(r.times.length, 20, '被"太密"拦掉了，应该照排')
+  assert.ok(r.avgGapMin < 10, '这个场景本来就该被判为密集')
+})
