@@ -378,6 +378,37 @@ function reportMeta() {
     if (Array.isArray(raw._set)) return new Set(raw._set)
     return new Set(Object.keys(DEFAULTS).filter((k) => k in raw && JSON.stringify(raw[k]) !== JSON.stringify(DEFAULTS[k])))
   })()
+
+  /**
+   * ⭐ 2026-10-30：**默认值改过之后，旧配置里的"旧默认"要跟着走。**
+   *
+   * 实际踩到的：`spread`（分时随机刷）在 10-28 那版默认是 `true`，用户没动过它，
+   * 但 config.json 里因此存了 `spread: true`。10-29 把默认改成 `false` 之后，
+   * `loadCfg()` 那条「和默认值不一样 ⇒ 说明用户显式设过 ⇒ 以本地为准」的规则
+   * 就把这个 `true` 当成"用户选的"永久保留了 —— 于是设置页显示关闭、实际却一直在分时。
+   *
+   * 判据：**这个键从没进过 `_set`（用户没在面板里点过）**，且值正好等于旧默认值
+   *       ⇒ 它是旧默认留下的，改成新默认。
+   * 只要用户真点过一下，`_set` 里就会有它，绝不会被这条迁移覆盖。
+   */
+  const DEFAULT_MIGRATIONS = [
+    { key: 'spread', oldDefault: true, newDefault: false },
+  ]
+  try {
+    const raw = readJson(cfgFile, {})
+    const setList = Array.isArray(raw._set) ? raw._set : []
+    let changed = false
+    for (const m of DEFAULT_MIGRATIONS) {
+      if (setList.includes(m.key)) continue                       // 用户设过 ⇒ 不动
+      if (!(m.key in raw)) continue
+      if (JSON.stringify(raw[m.key]) !== JSON.stringify(m.oldDefault)) continue
+      if (JSON.stringify(DEFAULTS[m.key]) === JSON.stringify(m.oldDefault)) continue  // 默认没变过
+      raw[m.key] = m.newDefault
+      changed = true
+      log(`配置迁移：${m.key} 是旧默认值（${JSON.stringify(m.oldDefault)}），你没设过它 ⇒ 改成新默认 ${JSON.stringify(m.newDefault)}`)
+    }
+    if (changed) writeJson(cfgFile, raw)
+  } catch { /* 迁移失败不影响启动 */ }
   const CFG_SIG = ['perDay', 'mentionName', 'replyToComments', 'overlayMcp']   // 靠这几个键认出"哪一行是我们"
   let settingsRow = { at: 0, row: null }
   /**
